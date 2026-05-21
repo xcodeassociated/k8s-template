@@ -1,0 +1,114 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# INSTALL CLOUDNATIVE-PG OPERATOR FIRST (run once):
+#
+#   helm repo add cnpg https://cloudnative-pg.github.io/charts
+#   helm repo update
+#   helm install cnpg cnpg/cloudnative-pg \
+#     --namespace postgres \
+#     --create-namespace
+#
+#   Verify:
+#     kubectl get deployment -n postgres cnpg-controller-manager
+#
+# Services created per cluster by the operator:
+#   <cluster-name>-rw  → always the primary   (use for writes and migrations)
+#   <cluster-name>-ro  → replica round-robin  (use for read-heavy workloads)
+#   <cluster-name>-r   → any instance
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── postgres-app (application database) ─────────────────────────────────────
+# 1 primary + 2 replicas → 3 instances total
+#
+# In-cluster connection strings:
+#   Write: postgres-app-rw.postgres.svc.cluster.local:5432
+#   Read:  postgres-app-ro.postgres.svc.cluster.local:5432
+#   DB:    application   User: admin
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: postgres-app
+  namespace: postgres
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.3
+
+  postgresql:
+    parameters:
+      max_connections: "200"
+      shared_buffers: "256MB"
+      effective_cache_size: "768MB"
+      work_mem: "4MB"
+      maintenance_work_mem: "64MB"
+      checkpoint_completion_target: "0.9"
+      wal_buffers: "16MB"
+      log_min_duration_statement: "1000"  # log queries slower than 1s
+
+  bootstrap:
+    initdb:
+      database: application
+      owner: admin
+      secret:
+        name: postgres-app-credentials
+
+  storage:
+    size: 1Gi
+    storageClass: longhorn
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+
+---
+# ─── postgres-keycloak (Keycloak auth database) ───────────────────────────────
+# 1 primary + 2 replicas → 3 instances total
+#
+# In-cluster connection strings:
+#   Write: postgres-keycloak-rw.postgres.svc.cluster.local:5432
+#   Read:  postgres-keycloak-ro.postgres.svc.cluster.local:5432
+#   DB:    keycloak   User: keycloak
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: postgres-keycloak
+  namespace: postgres
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.3
+
+  postgresql:
+    parameters:
+      max_connections: "100"
+      shared_buffers: "128MB"
+      effective_cache_size: "384MB"
+      work_mem: "4MB"
+
+  bootstrap:
+    initdb:
+      database: keycloak
+      owner: keycloak
+      secret:
+        name: postgres-keycloak-credentials
+
+  storage:
+    size: 1Gi
+    storageClass: longhorn
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname

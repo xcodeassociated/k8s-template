@@ -1,0 +1,86 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# INSTALL MONGODB COMMUNITY OPERATOR FIRST (run once):
+#
+#   helm repo add mongodb https://mongodb.github.io/helm-charts
+#   helm repo update
+#   helm install mongodb-community-operator mongodb/community-operator \
+#     --namespace mongo --create-namespace \
+#     --set operator.watchNamespace=mongo
+#
+#   Verify:
+#     kubectl get pods -n mongo -l app.kubernetes.io/name=mongodb-kubernetes-operator
+#
+# In-cluster connection string:
+#   mongodb://user:<password>@mongodb-rs-svc.mongo.svc.cluster.local:27017/admin?replicaSet=rs0
+#
+# The operator creates a Secret with the full connection string:
+#   kubectl get secret mongodb-rs-admin-user -n mongo \
+#     -o jsonpath='{.data.connectionString\.standardSrv}' | base64 -d
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── MongoDBCommunity (3-member replica set) ──────────────────────────────────
+# Service created by operator: mongodb-rs-svc.mongo.svc.cluster.local:27017
+apiVersion: mongodbcommunity.mongodb.com/v1
+kind: MongoDBCommunity
+metadata:
+  name: mongodb-rs
+  namespace: mongo
+spec:
+  members: 3
+  type: ReplicaSet
+  version: "8.2.6"
+
+  security:
+    authentication:
+      modes:
+        - SCRAM
+
+  users:
+    - name: user
+      db: admin # todo: change!
+      passwordSecretRef:
+        name: mongodb-admin-password
+      roles:
+        - name: root
+          db: admin
+        - name: readWriteAnyDatabase
+          db: admin
+      scramCredentialsSecretName: mongodb-scram-credentials
+
+  additionalMongodConfig:
+    storage.wiredTiger.engineConfig.journalCompressor: zlib
+
+  statefulSet:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: mongod
+              resources:
+                requests:
+                  cpu: 250m
+                  memory: 512Mi
+                limits:
+                  cpu: "1"
+                  memory: 2Gi
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchExpressions:
+                      - key: app
+                        operator: In
+                        values:
+                          - mongodb-rs-svc
+                  topologyKey: kubernetes.io/hostname
+
+      volumeClaimTemplates:
+        - metadata:
+            name: data-volume
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 1Gi
+            storageClassName: longhorn

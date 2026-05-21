@@ -1,0 +1,136 @@
+# Grafana OTEL-LGTM (Loki + Grafana + Tempo + Mimir — all-in-one)
+#
+# In-cluster addresses:
+#   UI:        http://grafana.grafana.svc.cluster.local:3000
+#   OTEL gRPC: http://grafana.grafana.svc.cluster.local:4317
+#   OTEL HTTP: http://grafana.grafana.svc.cluster.local:4318
+#
+# NOTE: otel-lgtm is an all-in-one convenience image suited for small-to-medium
+# production observability. For large-scale setups, consider deploying
+# kube-prometheus-stack + Loki + Tempo separately via Helm.
+
+# ─── PVC ──────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-data
+  namespace: grafana
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: longhorn
+
+---
+# ─── Deployment ───────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  strategy:
+    type: Recreate   # safe for single-replica + PVC (avoids two pods fighting over the volume)
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/otel-lgtm:0.22.1   # pin to a specific version; update deliberately
+          ports:
+            - containerPort: 3000
+              name: ui
+            - containerPort: 4317
+              name: otel-grpc
+            - containerPort: 4318
+              name: otel-http
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          volumeMounts:
+            - name: grafana-data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 5
+      volumes:
+        - name: grafana-data
+          persistentVolumeClaim:
+            claimName: grafana-data
+
+---
+# ─── Service ──────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: grafana
+spec:
+  selector:
+    app: grafana
+  ports:
+    - port: 3000
+      targetPort: 3000
+      name: ui
+    - port: 4317
+      targetPort: 4317
+      name: otel-grpc
+    - port: 4318
+      targetPort: 4318
+      name: otel-http
+  type: ClusterIP
+
+---
+# ─── Ingress ──────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana-ingress
+  namespace: grafana
+  annotations:
+    cert-manager.io/cluster-issuer: acme-issuer
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/service-upstream: "true"
+    nginx.ingress.kubernetes.io/whitelist-source-range: |
+      10.0.0.0/8,
+      172.16.0.0/12,
+      192.168.0.0/16
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: otel.softeno.dev
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000
+  tls:
+    - hosts:
+        - "*.softeno.dev"
+      secretName: main-certificate

@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: react-typescript-template
+  labels:
+    app: react-typescript-template
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: react-typescript-template
+  template:
+    metadata:
+      labels:
+        app: react-typescript-template
+      annotations:
+        linkerd.io/inject: "enabled"
+    spec:
+      containers:
+        - name: react-typescript-template
+          image: xcodeassociated/react-typescript-vite-template:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: react-typescript-template
+  labels:
+    app: react-typescript-template
+spec:
+  selector:
+    app: react-typescript-template
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+  type: ClusterIP
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: react-typescript-template
+  labels:
+    app: react-typescript-template
+  annotations:
+    cert-manager.io/cluster-issuer: acme-issuer
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # Uncomment to restrict to specific IPs:
+    # nginx.ingress.kubernetes.io/whitelist-source-range: "A.B.C.D/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - "app.softeno.dev"
+        - "www.app.softeno.dev"
+      secretName: app-certificate-prod
+  rules:
+    - host: "app.softeno.dev"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: react-typescript-template
+                port:
+                  number: 80
+    - host: "www.app.softeno.dev"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: react-typescript-template
+                port:
+                  number: 80
+
+### add hosts to /etc/hosts for local testing:
+# sudo sh -c 'echo "127.0.0.1 app.softeno.dev" >> /etc/hosts'
+# sudo sh -c 'echo "127.0.0.1 www.app.softeno.dev" >> /etc/hosts'

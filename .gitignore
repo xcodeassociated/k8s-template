@@ -1,0 +1,33 @@
+# OS / editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Local environment files
+.env
+.env.*
+!.env.template
+!.env.*.template
+
+# Local/private Kubernetes secrets
+secrets.yaml
+secrets.local.yaml
+secrets.*.local.yaml
+
+# Private key and certificate material
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.csr
+
+# Local kubeconfig files
+kubeconfig
+*.kubeconfig
+
+# Local generated files and scratch data
+volumes/
+tmp/
+*.tmp
+*.bak

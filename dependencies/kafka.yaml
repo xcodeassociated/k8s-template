@@ -1,0 +1,316 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# PREREQUISITES — run once before applying this file:
+#
+#   helm repo add strimzi https://strimzi.io/charts/
+#   helm repo update
+#   helm install strimzi-operator strimzi/strimzi-kafka-operator \
+#     --namespace kafka --create-namespace \
+#     --set watchNamespaces="{kafka}"
+#
+#   Verify operator is ready:
+#     kubectl get pods -n kafka -l name=strimzi-cluster-operator
+#
+# In-cluster bootstrap (plain, no TLS):
+#   kafka-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── Controller node pool (3 nodes — KRaft quorum) ───────────────────────────
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: controller
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: kafka-cluster
+spec:
+  replicas: 3
+  roles:
+    - controller
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 1Gi
+        deleteClaim: false
+        class: longhorn
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+  template:
+    pod:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  strimzi.io/pool-name: controller
+              topologyKey: kubernetes.io/hostname
+
+---
+# ─── Broker node pool (3 nodes) ──────────────────────────────────────────────
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: broker
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: kafka-cluster
+spec:
+  replicas: 3
+  roles:
+    - broker
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 1Gi
+        deleteClaim: false
+        class: longhorn
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  template:
+    pod:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  strimzi.io/pool-name: broker
+              topologyKey: kubernetes.io/hostname
+
+---
+# ─── Kafka cluster ────────────────────────────────────────────────────────────
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: kafka-cluster
+  namespace: kafka
+  annotations:
+    strimzi.io/node-pools: enabled
+    strimzi.io/kraft: enabled
+spec:
+  kafka:
+    version:  4.2.0
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+
+    config:
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2
+      default.replication.factor: 3
+      min.insync.replicas: 2
+      log.retention.hours: 168
+      log.segment.bytes: 1073741824
+      num.network.threads: 3
+      num.io.threads: 8
+
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: kafka-metrics
+          key: kafka-metrics-config.yml
+
+  entityOperator:
+    topicOperator: {}
+    userOperator: {}
+
+---
+# ─── Metrics ConfigMap ────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-metrics
+  namespace: kafka
+data:
+  kafka-metrics-config.yml: |
+    lowercaseOutputName: true
+    rules:
+      - pattern: kafka.server<type=(.+), name=(.+), clientId=(.+), topic=(.+), partition=(.*)><>Value
+        name: kafka_server_$1_$2
+        type: GAUGE
+        labels:
+          clientId: "$3"
+          topic: "$4"
+          partition: "$5"
+      - pattern: kafka.server<type=(.+), name=(.+), clientId=(.+), brokerHost=(.+), brokerPort=(.+)><>Value
+        name: kafka_server_$1_$2
+        type: GAUGE
+        labels:
+          clientId: "$3"
+          broker: "$4:$5"
+      - pattern: kafka.server<type=(.+), name=(.+)><>OneMinuteRate
+        name: kafka_server_$1_$2_rate1m
+        type: GAUGE
+      - pattern: kafka.server<type=(.+), name=(.+)><>Value
+        name: kafka_server_$1_$2
+        type: GAUGE
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# TOPICS
+#
+# IMPORTANT — Topic name vs resource name:
+#   Kubernetes resource names cannot contain underscores, so we use hyphens in
+#   metadata.name and set spec.topicName explicitly for the actual Kafka topic
+#   name used by your applications.
+#
+# The Strimzi Topic Operator reconciles these automatically:
+#   kubectl apply  → topic created
+#   kubectl edit   → topic config updated
+#   kubectl delete → topic deleted
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── sample_topic_2 ──────────────────────────────────────────────────────────
+# Used by: spring-reactive-mongo (TX/RX), spring-reactive-r2dbc (TX/RX)
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: sample-topic-2          # k8s resource name (no underscores allowed)
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: kafka-cluster
+spec:
+  topicName: sample_topic_2     # actual Kafka topic name used by your apps
+  partitions: 3
+  replicas: 3
+  config:
+    retention.ms: "604800000"   # 7 days
+    min.insync.replicas: "2"
+
+---
+# ─── keycloak-events ─────────────────────────────────────────────────────────
+# Used by: spring-reactive-mongo (KAFKA_KEYCLOAK), keycloak publisher
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: keycloak-events
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: kafka-cluster
+spec:
+  partitions: 3
+  replicas: 3
+  config:
+    retention.ms: "604800000"
+    min.insync.replicas: "2"
+
+---
+# ─── keycloak-admin-events ───────────────────────────────────────────────────
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: keycloak-admin-events
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: kafka-cluster
+spec:
+  partitions: 3
+  replicas: 3
+  config:
+    retention.ms: "604800000"
+    min.insync.replicas: "2"
+
+---
+# ─── Kafka UI ─────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-ui
+  namespace: kafka
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-ui
+  template:
+    metadata:
+      labels:
+        app: kafka-ui
+    spec:
+      containers:
+        - name: kafka-ui
+          image: provectuslabs/kafka-ui:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: KAFKA_CLUSTERS_0_NAME
+              value: "production"
+            - name: KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS
+              value: "kafka-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092"
+            - name: DYNAMIC_CONFIG_ENABLED
+              value: "true"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-ui
+  namespace: kafka
+spec:
+  selector:
+    app: kafka-ui
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: ui
+  type: ClusterIP
+
+---
+# ─── Kafka UI Ingress ─────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kafka-ui-ingress
+  namespace: kafka
+  annotations:
+    cert-manager.io/cluster-issuer: acme-issuer
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/service-upstream: "true"
+    nginx.ingress.kubernetes.io/whitelist-source-range: |
+      10.0.0.0/8,
+      172.16.0.0/12,
+      192.168.0.0/16
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: kafka.softeno.dev
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kafka-ui
+                port:
+                  number: 8080
+  tls:
+    - hosts:
+        - "*.softeno.dev"
+      secretName: main-certificate

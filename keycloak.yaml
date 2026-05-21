@@ -1,0 +1,137 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Keycloak with Kafka event publisher
+#
+# Depends on:
+#   - postgres-keycloak cluster  (postgres namespace)
+#   - kafka-cluster              (kafka namespace)
+#
+# ⚠  BEFORE DEPLOYING:
+#   1. KC_DB_PASSWORD in secret-keycloak MUST match
+#      postgres-keycloak-credentials.password in postgres.yaml.
+#   2. The custom image xcodeassociated/keycloak-kafka:latest bundles
+#      the Keycloak-Kafka event listener. Make sure it is reachable.
+#   3. This config uses 'start-dev' (no TLS, no hostname verification).
+#      Acceptable behind an nginx TLS-terminating ingress, but NOT for
+#      standalone exposure. Change to 'start' if you need embedded TLS.
+# ─────────────────────────────────────────────────────────────────────────────
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: configmap-keycloak
+data:
+  # ── Kafka ──────────────────────────────────────────────────────────────────
+  KAFKA_TOPIC: "keycloak-events"
+  KAFKA_ADMIN_TOPIC: "keycloak-admin-events"
+  KAFKA_CLIENT_ID: "keycloak"
+  KAFKA_BOOTSTRAP_SERVERS: "kafka-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092"
+  KAFKA_EVENTS: "REGISTER,LOGIN,LOGOUT"
+
+  # ── Database (CNPG postgres-keycloak cluster) ──────────────────────────────
+  # Always connect to -rw service (primary) — port is always 5432 with CNPG.
+  KC_DB: "postgres"
+  KC_DB_URL_HOST: "postgres-keycloak-rw.postgres.svc.cluster.local"
+  KC_DB_URL_PORT: "5432"
+  KC_DB_URL_DATABASE: "keycloak"
+  KC_DB_SCHEMA: "public"
+
+  # ── Proxy / hostname ───────────────────────────────────────────────────────
+  KC_HTTP_ENABLED: "true"
+  KC_PROXY: "edge"
+  KC_PROXY_ADDRESS_FORWARDING: "true"
+  PROXY_ADDRESS_FORWARDING: "true"
+  KC_HOSTNAME_URL: "https://auth.softeno.dev"
+  KC_HOSTNAME_ADMIN_URL: "https://auth.softeno.dev"
+  KC_HOSTNAME_PATH: "/"
+  KC_HOSTNAME_STRICT: "false"
+  KC_HOSTNAME_STRICT_HTTPS: "false"
+  KC_HOSTNAME_STRICT_BACKCHANNEL: "true"
+
+---
+
+# ─── Deployment ───────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+spec:
+  selector:
+    matchLabels:
+      app: keycloak
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: keycloak
+      annotations:
+        linkerd.io/inject: "enabled"
+    spec:
+      containers:
+        - name: keycloak
+          image: xcodeassociated/keycloak-kafka:latest
+          imagePullPolicy: Always
+          # 'start-dev' disables production hardening (no TLS, relaxed hostname checks).
+          # This is fine behind an nginx edge proxy, but switch to 'start' if you need
+          # Keycloak to handle TLS directly.
+          args: ["start-dev", "--verbose"]
+          envFrom:
+            - configMapRef:
+                name: configmap-keycloak
+            - secretRef:
+                name: secret-keycloak
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+
+---
+# ─── Service ──────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+spec:
+  selector:
+    app: keycloak
+  ports:
+    - protocol: "TCP"
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP   # nginx ingress handles external access; NodePort not needed
+
+---
+# ─── Ingress ──────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auth-softeno
+  annotations:
+    cert-manager.io/cluster-issuer: acme-issuer
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    nginx.ingress.kubernetes.io/proxy-redirect-off: "true"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "128k"   # needed for large Keycloak headers/cookies
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - "auth.softeno.dev"
+      secretName: auth-certificate-prod
+  rules:
+    - host: "auth.softeno.dev"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak
+                port:
+                  number: 8080
+
+### add host to /etc/hosts for local testing:
+# sudo sh -c 'echo "127.0.0.1 auth.softeno.dev" >> /etc/hosts'

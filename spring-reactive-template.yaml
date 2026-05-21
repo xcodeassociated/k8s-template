@@ -1,0 +1,196 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spring-reactive-mongo-config
+  labels:
+    app: spring-reactive-mongo
+data:
+  SERVER_FORWARD_HEADERS_STRATEGY: "framework"
+
+  # ── MongoDB (Community Operator replica set) ───────────────────────────────
+  # The operator creates the service: mongodb-rs-svc.mongo.svc.cluster.local
+  MONGO_HOST: "mongodb-rs-svc.mongo.svc.cluster.local"
+  MONGO_PORT: "27017"
+  MONGO_USER: "user"
+  MONGO_DB: "admin" # todo: change!
+  MONGO_RS: "mongodb-rs"
+
+  # ── Kafka (Strimzi kafka-cluster) ─────────────────────────────────────────
+  KAFKA_URL: "kafka-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092"
+  KAFKA_GROUP: "sample-group-jvm"
+  KAFKA_TOPIC_TX: "sample_topic_2"
+  KAFKA_TOPIC_RX: "sample_topic_2"
+  KAFKA_KEYCLOAK: "keycloak-events"
+
+  # ── Keycloak / OAuth2 ──────────────────────────────────────────────────────
+  OAUTH_CLIENT_ID: "backend"
+  OAUTH_GRANT_TYPE: "client_credentials"
+  OAUTH_ISSUER_URI: "https://auth.softeno.dev/realms/app"
+  OAUTH_JWK_SET_URI: "https://auth.softeno.dev/realms/app/protocol/openid-connect/certs"
+  OAUTH_AUTHORIZATION_URI: "https://auth.softeno.dev/realms/app/protocol/openid-connect/auth"
+  OAUTH_TOKEN_URI: "https://auth.softeno.dev/realms/app/protocol/openid-connect/token"
+  OAUTH_USER_INFO_URI: "https://auth.softeno.dev/realms/app/protocol/openid-connect/userinfo"
+
+  # ── Inter-service calls (both apps run in the same namespace: default) ─────
+  EXTERNAL_URL: "http://spring-reactive-r2dbc:8082/sample-secured"
+  EXTERNAL_NAME: "spring-reactive-r2dbc-template"
+  EXTERNAL_GRAPH_QL: "http://spring-reactive-r2dbc:8082/graphql"
+  SPRING_GRPC_CLIENT_CHANNELS_EXTERNAL_ADDRESS: "spring-reactive-r2dbc:9082"
+
+  # ── Observability (Grafana otel-lgtm in grafana namespace) ─────────────────
+  MANAGEMENT_OTLP_METRICS_EXPORT_URL: "http://grafana.grafana.svc.cluster.local:4318/v1/metrics"
+  MANAGEMENT_OPENTELEMETRY_TRACING_EXPORT_OTLP_ENDPOINT: "http://grafana.grafana.svc.cluster.local:4318/v1/traces"
+  MANAGEMENT_OPENTELEMETRY_LOGGING_EXPORT_OTLP_ENDPOINT: "http://grafana.grafana.svc.cluster.local:4318/v1/logs"
+
+---
+# ─── Deployment ───────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spring-reactive-mongo
+  labels:
+    app: spring-reactive-mongo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spring-reactive-mongo
+  template:
+    metadata:
+      labels:
+        app: spring-reactive-mongo
+      annotations:
+        linkerd.io/inject: "enabled"
+    spec:
+      containers:
+        - name: spring-reactive-mongo
+          image: xcodeassociated/spring-reactive-template:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: grpc
+              containerPort: 9080
+          envFrom:
+            - configMapRef:
+                name: spring-reactive-mongo-config
+            - secretRef:
+                name: spring-reactive-mongo-secret
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2048Mi"
+
+---
+# ─── Service ──────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: spring-reactive-mongo
+  labels:
+    app: spring-reactive-mongo
+spec:
+  selector:
+    app: spring-reactive-mongo
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: grpc
+      port: 9080
+      targetPort: 9080
+  type: ClusterIP
+
+---
+# ─── Ingress (HTTP + WebSocket) ───────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: spring-reactive-mongo
+  labels:
+    app: spring-reactive-mongo
+  annotations:
+    cert-manager.io/cluster-issuer: acme-issuer
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # Sticky sessions — important for WebSocket reconnects
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/affinity-mode: "persistent"
+    nginx.ingress.kubernetes.io/session-cookie-name: "ws-route"
+    nginx.ingress.kubernetes.io/session-cookie-expires: "3600"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
+    nginx.ingress.kubernetes.io/x-forwarded-prefix: "/spring-reactive-template"
+    nginx.ingress.kubernetes.io/rewrite-target: "/$2"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - "api.softeno.dev"
+      secretName: api-certificate-prod
+  rules:
+    - host: "api.softeno.dev"
+      http:
+        paths:
+          - path: /spring-reactive-template(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: spring-reactive-mongo
+                port:
+                  number: 8080
+
+### add host to /etc/hosts:
+# sudo sh -c 'echo "127.0.0.1 api.softeno.dev" >> /etc/hosts'
+
+---
+# ─── Ingress (gRPC) ───────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: spring-reactive-mongo-grpc
+  annotations:
+    cert-manager.io/cluster-issuer: acme-issuer
+    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - "api.softeno.dev"
+      secretName: api-certificate-prod
+  rules:
+    - host: "api.softeno.dev"
+      http:
+        paths:
+          - path: /com.softeno.template.grpc.SampleGrpcService
+            pathType: Prefix
+            backend:
+              service:
+                name: spring-reactive-mongo
+                port:
+                  number: 9080
+
+### example gRPC unary call:
+# GRPC https://api.softeno.dev/com.softeno.template.grpc.SampleGrpcService/Echo
+# { "data": "123" }

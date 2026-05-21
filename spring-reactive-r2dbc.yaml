@@ -1,0 +1,148 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spring-reactive-r2dbc-config
+  labels:
+    app: spring-reactive-r2dbc
+data:
+  SERVER_FORWARD_HEADERS_STRATEGY: "framework"
+
+  # ── Database (CNPG postgres-app cluster) ───────────────────────────────────
+  # Use -rw service for writes and Liquibase migrations (always hits the primary).
+  SPRING_R2DBC_URL: "r2dbc:postgresql://postgres-app-rw.postgres.svc.cluster.local:5432/application"
+  SPRING_R2DBC_USERNAME: "admin"
+  SPRING_LIQUIBASE_URL: "jdbc:postgresql://postgres-app-rw.postgres.svc.cluster.local:5432/application"
+  SPRING_LIQUIBASE_USER: "admin"
+
+  # ── Keycloak / OAuth2 ──────────────────────────────────────────────────────
+  SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI: "https://auth.softeno.dev/realms/app"
+  SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI: "https://auth.softeno.dev/realms/app/protocol/openid-connect/certs"
+  SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_KEYCLOAK_CLIENT_ID: "backend2"
+  SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_KEYCLOAK_AUTHORIZATION_GRANT_TYPE: "client_credentials"
+  SPRING_SECURITY_OAUTH2_CLIENT_PROVIDER_KEYCLOAK_AUTHORIZATION_URI: "https://auth.softeno.dev/realms/app/protocol/openid-connect/auth"
+  SPRING_SECURITY_OAUTH2_CLIENT_PROVIDER_KEYCLOAK_TOKEN_URI: "https://auth.softeno.dev/realms/app/protocol/openid-connect/token"
+  SPRING_SECURITY_OAUTH2_CLIENT_PROVIDER_KEYCLOAK_USER_INFO_URI: "https://auth.softeno.dev/realms/app/protocol/openid-connect/userinfo"
+  SPRING_SECURITY_OAUTH2_CLIENT_PROVIDER_KEYCLOAK_JWK_SET_URI: "https://auth.softeno.dev/realms/app/protocol/openid-connect/certs"
+
+  # ── Kafka (Strimzi kafka-cluster) ─────────────────────────────────────────
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: "kafka-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092"
+  SPRING_KAFKA_CONSUMER_GROUP_ID: "other-group-jvm"
+  COM_SOFTENO_KAFKA_TX: "sample_topic_2"
+  COM_SOFTENO_KAFKA_RX: "sample_topic_2"
+
+  # ── Inter-service calls (both apps run in the same namespace: default) ─────
+  COM_SOFTENO_EXTERNAL_URL: "http://spring-reactive-mongo:8080/sample-secured"
+  COM_SOFTENO_EXTERNAL_NAME: "spring-reactive-mongo-template"
+  SPRING_GRPC_CLIENT_CHANNELS_EXTERNAL_ADDRESS: "spring-reactive-mongo:9080"
+
+  # ── Observability (Grafana otel-lgtm in grafana namespace) ─────────────────
+  MANAGEMENT_OTLP_METRICS_EXPORT_URL: "http://grafana.grafana.svc.cluster.local:4318/v1/metrics"
+  MANAGEMENT_OPENTELEMETRY_TRACING_EXPORT_OTLP_ENDPOINT: "http://grafana.grafana.svc.cluster.local:4318/v1/traces"
+  MANAGEMENT_OPENTELEMETRY_LOGGING_EXPORT_OTLP_ENDPOINT: "http://grafana.grafana.svc.cluster.local:4318/v1/logs"
+
+---
+# ─── Deployment ───────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spring-reactive-r2dbc
+  labels:
+    app: spring-reactive-r2dbc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spring-reactive-r2dbc
+  template:
+    metadata:
+      labels:
+        app: spring-reactive-r2dbc
+      annotations:
+        linkerd.io/inject: "enabled"
+    spec:
+      containers:
+        - name: spring-reactive-r2dbc
+          image: xcodeassociated/spring-reactive-r2dbc-template:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8082
+            - name: grpc
+              containerPort: 9082
+          envFrom:
+            - configMapRef:
+                name: spring-reactive-r2dbc-config
+            - secretRef:
+                name: spring-reactive-r2dbc-secret
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8082
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8082
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2048Mi"
+
+---
+# ─── Service ──────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: spring-reactive-r2dbc
+  labels:
+    app: spring-reactive-r2dbc
+spec:
+  selector:
+    app: spring-reactive-r2dbc
+  ports:
+    - name: http
+      port: 8082
+      targetPort: 8082
+    - name: grpc
+      port: 9082
+      targetPort: 9082
+  type: ClusterIP
+
+---
+# ─── Ingress ──────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: spring-reactive-r2dbc-ingress
+  annotations:
+    cert-manager.io/cluster-issuer: acme-issuer
+    nginx.ingress.kubernetes.io/proxy-set-headers: spring-reactive-r2dbc-headers
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/x-forwarded-prefix: "/spring-reactive-r2dbc-template"
+    nginx.ingress.kubernetes.io/rewrite-target: "/$2"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - "api.softeno.dev"
+      secretName: api-certificate-prod
+  rules:
+    - host: "api.softeno.dev"
+      http:
+        paths:
+          - path: /spring-reactive-r2dbc-template(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: spring-reactive-r2dbc
+                port:
+                  number: 8082
+
+### add host to /etc/hosts:
+# sudo sh -c 'echo "127.0.0.1 api.softeno.dev" >> /etc/hosts'

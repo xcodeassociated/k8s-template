@@ -29,16 +29,19 @@ Template services served by this stack:
 .
 ├── dependencies/
 │   ├── 00-namespaces.yaml
-│   ├── postgres.yaml
-│   ├── mongo.yaml
-│   ├── kafka.yaml
-│   └── grafana.yaml
-├── secrets.template.yaml   # committed placeholders only
-├── secrets.yaml            # local/private, ignored by git
-├── keycloak.yaml
-├── spring-reactive-r2dbc.yaml
-├── spring-reactive-template.yaml
-└── react-typescript-template.yaml
+│   ├── 01-secrets.template.yaml   # committed placeholders only
+│   ├── 01-secrets.yaml            # local/private, ignored by git
+│   ├── 02-postgres.yaml
+│   ├── 03-mongo.yaml
+│   ├── 04-kafka.yaml
+│   └── 05-grafana.yaml
+└── apps/
+    ├── 01-secrets.template.yaml   # committed placeholders only
+    ├── 01-secrets.yaml            # local/private, ignored by git
+    ├── 02-keycloak.yaml
+    ├── 03-spring-reactive-template.yaml
+    ├── 04-spring-reactive-r2dbc.yaml
+    └── 05-react-typescript-template.yaml
 ```
 
 ## Prerequisites
@@ -109,10 +112,11 @@ kubectl get pods -n kafka
 
 ### 3. Create private secrets
 
-Copy the template and fill in real values locally:
+Copy the templates and fill in real values locally:
 
 ```bash
-cp secrets.template.yaml secrets.yaml
+cp dependencies/01-secrets.template.yaml dependencies/01-secrets.yaml
+cp apps/01-secrets.template.yaml apps/01-secrets.yaml
 ```
 
 Required value relationships:
@@ -125,19 +129,21 @@ Required value relationships:
 Apply the local secret file:
 
 ```bash
-kubectl apply -f secrets.yaml
+kubectl apply -f dependencies/01-secrets.yaml
+kubectl apply -f apps/01-secrets.yaml
 ```
 
-`secrets.yaml` is intentionally ignored by git. For production GitOps, replace
-this manual file with External Secrets, SOPS, or Sealed Secrets.
+Local files matching `**/*secrets.yaml` are intentionally ignored by git;
+`*.template.yaml` files are committed placeholders only. For production GitOps,
+replace this manual file workflow with External Secrets, SOPS, or Sealed Secrets.
 
 ### 4. Deploy dependencies
 
 ```bash
-kubectl apply -f dependencies/postgres.yaml
-kubectl apply -f dependencies/mongo.yaml
-kubectl apply -f dependencies/kafka.yaml
-kubectl apply -f dependencies/grafana.yaml
+kubectl apply -f dependencies/02-postgres.yaml
+kubectl apply -f dependencies/03-mongo.yaml
+kubectl apply -f dependencies/04-kafka.yaml
+kubectl apply -f dependencies/05-grafana.yaml
 ```
 
 Watch readiness:
@@ -152,19 +158,19 @@ kubectl get pods -n grafana
 ### 5. Deploy Keycloak
 
 ```bash
-kubectl apply -f keycloak.yaml
+kubectl apply -f apps/02-keycloak.yaml
 kubectl rollout status deployment/keycloak
 ```
 
 After Keycloak is ready, create the required realm and OAuth clients, then update
-`secrets.yaml` if any generated client secrets changed.
+the local ignored secret files if any generated client secrets changed.
 
 ### 6. Deploy applications
 
 ```bash
-kubectl apply -f spring-reactive-r2dbc.yaml
-kubectl apply -f spring-reactive-template.yaml
-kubectl apply -f react-typescript-template.yaml
+kubectl apply -f apps/03-spring-reactive-template.yaml
+kubectl apply -f apps/04-spring-reactive-r2dbc.yaml
+kubectl apply -f apps/05-react-typescript-template.yaml
 
 kubectl rollout status deployment/spring-reactive-r2dbc
 kubectl rollout status deployment/spring-reactive-mongo
@@ -179,20 +185,21 @@ Kafka volumes, namespaces, or PVCs.
 Delete application resources first:
 
 ```bash
-kubectl delete -f react-typescript-template.yaml --ignore-not-found
-kubectl delete -f spring-reactive-template.yaml --ignore-not-found
-kubectl delete -f spring-reactive-r2dbc.yaml --ignore-not-found
-kubectl delete -f keycloak.yaml --ignore-not-found
+kubectl delete -f apps/05-react-typescript-template.yaml --ignore-not-found
+kubectl delete -f apps/04-spring-reactive-r2dbc.yaml --ignore-not-found
+kubectl delete -f apps/03-spring-reactive-template.yaml --ignore-not-found
+kubectl delete -f apps/02-keycloak.yaml --ignore-not-found
 ```
 
 Delete dependency resources and private secrets:
 
 ```bash
-kubectl delete -f dependencies/grafana.yaml --ignore-not-found
-kubectl delete -f dependencies/kafka.yaml --ignore-not-found
-kubectl delete -f dependencies/mongo.yaml --ignore-not-found
-kubectl delete -f dependencies/postgres.yaml --ignore-not-found
-kubectl delete -f secrets.yaml --ignore-not-found
+kubectl delete -f dependencies/05-grafana.yaml --ignore-not-found
+kubectl delete -f dependencies/04-kafka.yaml --ignore-not-found
+kubectl delete -f dependencies/03-mongo.yaml --ignore-not-found
+kubectl delete -f dependencies/02-postgres.yaml --ignore-not-found
+kubectl delete -f apps/01-secrets.yaml --ignore-not-found
+kubectl delete -f dependencies/01-secrets.yaml --ignore-not-found
 ```
 
 Optionally uninstall operators if nothing else uses them:
@@ -219,8 +226,8 @@ kubectl get pv
 
 ## Public repository checklist
 
-- Keep `secrets.template.yaml` placeholders only.
-- Keep `secrets.yaml` ignored and local/private.
+- Keep `dependencies/01-secrets.template.yaml` and `apps/01-secrets.template.yaml` placeholders only.
+- Keep local `**/*secrets.yaml` files ignored and private.
 - Do not commit kubeconfigs, certificates with private keys, tokens, or `.env` files.
 - Run a secret scan before publishing the repository.
 - Review hard-coded domains, image names, storage sizes, and ingress settings.

@@ -10,9 +10,9 @@
 !.env.*.template
 
 # Local/private Kubernetes secrets
-secrets.yaml
-secrets.local.yaml
-secrets.*.local.yaml
+**/*secrets.yaml
+**/*secrets.local.yaml
+**/*secrets.*.local.yaml
 
 # Private key and certificate material
 *.key

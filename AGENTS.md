@@ -76,6 +76,9 @@ Cleanup is destructive (`kubectl delete -f ...` in reverse order — see README 
 
 ## Maintaining the docs
 
-**`README.md` must always be kept up to date.** After finishing development work, check whether the change affects the README (features, structure, optional-feature removal, prerequisites, deploy/cleanup order, endpoints, secret relationships) and update it in the same task if so. Never hand off code changes that leave the README stale.
+**Both `README.md` and `AGENTS.md` must always be kept up to date.** After finishing development work, and before handing off, check the change against both files and update them in the same task if affected:
 
-Update `AGENTS.md` together with `README.md` whenever namespaces, secret relationships, deploy order, hostnames, or prerequisite operators change. Prefer verified commands; label anything untested.
+- `README.md` — features, project structure, optional-feature removal, prerequisites, deploy/cleanup order, endpoints, secret relationships.
+- `AGENTS.md` — commands and verification, layout, namespaces, secret cross-references, prerequisites, gotchas (ports, image tags, Kafka topic naming, Linkerd/ingress annotations).
+
+Never hand off changes that leave either doc stale. Prefer verified commands; label anything untested.

@@ -1,29 +1,50 @@
-# One Rancher step, included per computed chart version (step = version string).
-# Skips everything except the first step when the target minor equals the
-# installed minor and the latest patch is already installed.
+# One step (step = chart version string) along an auto-discovered Rancher upgrade path.
+# Rancher only supports upgrading one minor at a time (latest patch per minor). The
+# step target is computed at runtime by stepwise-path.py from `helm search repo
+# --versions` — never hardcoded. When the chart's kubeVersion gate refuses our k3s
+# (released charts certify <=1.36/1.37 while we run newer), retry by pulling the
+# chart and stripping its kubeVersion line — helm 4 has no --kube-version flag.
+# Values: default helm upgrade semantics (old user values merged over the NEW
+# chart's defaults) — never --reuse-values, it ignores the new defaults and breaks
+# templates on renamed/new value keys (verified with the networkExposure nil pointer).
 
 - name: "Upgrade Rancher to {{ step }}"
   ansible.builtin.command: >-
     helm upgrade rancher {{ rancher_repo }} --namespace cattle-system
-    --version {{ step }} --reuse-values
+    --version {{ step }}
     --set ingress.enabled=false --set bootstrapPassword=admin --set ingress.tls.source=none
-  when: step != rancher_installed.stdout
   register: rancher_step
-  failed_when:
-    - rancher_step.rc != 0
-    - "'kubeVersion' not in rancher_step.stderr"
+  failed_when: false
 
-- name: Warn if Rancher blocked by kubeVersion gate (k3s above Rancher's support matrix)
-  ansible.builtin.debug:
-    msg: "SKIPPED Rancher {{ step }}: {{ rancher_step.stderr | default('') }} — Rancher stays on {{ rancher_installed.stdout }} until a release certifies this k3s version"
+- name: Retry via locally patched chart (kubeVersion stripped — helm 4 has no --kube-version flag)
+  ansible.builtin.shell: |
+    set -e
+    rm -rf /tmp/rancher-chart
+    helm pull {{ rancher_repo }} --version {{ step }} --untar --untardir /tmp/rancher-chart
+    sed -i '/^kubeVersion:/d' /tmp/rancher-chart/rancher/Chart.yaml
+    helm upgrade rancher /tmp/rancher-chart/rancher --namespace cattle-system \
+      --set ingress.enabled=false --set bootstrapPassword=admin \
+      --set ingress.tls.source=none
   when: rancher_step.rc is defined and rancher_step.rc != 0 and 'kubeVersion' in rancher_step.stderr | default('')
+  register: rancher_forced
+  failed_when: false
+
+- name: Warn about forced upgrade
+  ansible.builtin.debug:
+    msg: "FORCED Rancher {{ step }} past its kubeVersion gate (chart patched locally) — OUTSIDE SUSE support matrix with k3s {{ k3s_running | default('1.37') }}. Watch rancher pod logs; rollback = helm rollback rancher -n cattle-system."
+  when: rancher_forced.rc is defined and rancher_forced.rc == 0
+
+- name: Fail if forced upgrade also failed
+  ansible.builtin.fail:
+    msg: "Rancher {{ step }} failed even with patched chart: {{ rancher_forced.stderr | default(rancher_step.stderr) }}"
+  when: rancher_forced.rc is defined and rancher_forced.rc != 0
 
 - name: Wait for rancher deployment rollout
   ansible.builtin.command: kubectl -n cattle-system rollout status deploy/rancher --timeout=300s
-  when: rancher_step is not skipped and rancher_step.rc == 0
+  when: rancher_step is not skipped and ((rancher_step.rc == 0) or (rancher_forced.rc | default(1)) == 0)
   changed_when: false
 
 - name: Wait for rancher pods Ready
   ansible.builtin.command: kubectl -n cattle-system wait --for=condition=Ready pod -l app=rancher --timeout=300s
-  when: rancher_step is not skipped and rancher_step.rc == 0
+  when: rancher_step is not skipped and ((rancher_step.rc == 0) or (rancher_forced.rc | default(1)) == 0)
   changed_when: false

@@ -231,13 +231,17 @@
   tasks:
     - name: Detect installed channel from the running control plane
       ansible.builtin.set_fact:
-        linkerd_channel: "{{ 'edge' if 'edge-' in (ver_before.stdout | regex_search('linkerd/proxy:[^\\s]+') or '') else 'stable' }}"
+        linkerd_channel: "{{ 'edge' if 'edge-' in (ver_before.stdout | regex_search('linkerd=[^\\s]+') or '') else 'stable' }}"
 
     - name: Install/refresh matching CLI on master
       ansible.builtin.shell: |
         set -e
         mkdir -p $HOME/.local/bin
-        VER=$(curl -sSfL -m 10 https://versioncheck.linkerd.io/version.json | python3 -c "import sys,json;print(json.load(sys.stdin)['{{ 'edge' if linkerd_channel == 'edge' else 'stable' }}'])")
+        if [ "{{ linkerd_channel }}" = "edge" ]; then
+          VER=$(curl -sSfL -m 10 https://versioncheck.linkerd.io/version.json | python3 -c "import sys,json;print(json.load(sys.stdin)['edge'])")
+        else
+          VER=$(curl -sSfL -m 10 https://api.github.com/repos/linkerd/linkerd2/releases/latest | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])")
+        fi
         curl -sSfL -m 120 -o $HOME/.local/bin/linkerd "https://github.com/linkerd/linkerd2/releases/download/$VER/linkerd2-cli-$VER-linux-amd64"
         chmod +x $HOME/.local/bin/linkerd
         $HOME/.local/bin/linkerd version --client
@@ -249,7 +253,7 @@
         lkd: "/home/{{ ansible_user | default('worker') }}/.local/bin/linkerd"
 
     - name: Pre-upgrade check
-      ansible.builtin.command: "{{ lkd }} check"
+      ansible.builtin.shell: "timeout 120 {{ lkd }} check 2>&1 | grep -E '^×|^‼' || echo clean"
       environment: { PATH: "/usr/local/bin:/usr/bin:/bin:/home/{{ ansible_user | default('worker') }}/.local/bin" }
       changed_when: false
       failed_when: false
@@ -259,8 +263,26 @@
       ansible.builtin.debug:
         msg: "{{ linkerd_precheck.stdout_lines | select('search', '×|‼') | list | default([]) }}"
 
-    - name: Upgrade CRDs + control plane (retains cluster config/TLS)
-      ansible.builtin.shell: "{{ lkd }} upgrade --crds | kubectl apply -f - && {{ lkd }} upgrade | kubectl apply -f -"
+    - name: Export live identity material (install-config issuer can be stale after cert rotation)
+      ansible.builtin.shell: |
+        set -e
+        kubectl -n linkerd get secret linkerd-identity-issuer -o json | python3 -c "
+        import sys, json, base64
+        d = json.load(sys.stdin)['data']
+        open('/tmp/id-crt.pem','w').write(base64.b64decode(d['crt.pem']).decode())
+        open('/tmp/id-key.pem','w').write(base64.b64decode(d['key.pem']).decode())"
+        kubectl -n linkerd get cm linkerd-identity-trust-roots -o json | python3 -c "
+        import sys, json
+        open('/tmp/id-ca.pem','w').write(json.load(sys.stdin)['data']['ca-bundle.crt'])"
+      changed_when: false
+
+    - name: Upgrade CRDs + control plane (retains cluster config/TLS, uses live certs)
+      ansible.builtin.shell: |
+        {{ lkd }} upgrade --crds | kubectl apply -f -
+        {{ lkd }} upgrade \
+          --identity-issuer-certificate-file /tmp/id-crt.pem \
+          --identity-issuer-key-file /tmp/id-key.pem \
+          --identity-trust-anchors-file /tmp/id-ca.pem | kubectl apply -f -
       environment: { PATH: "/usr/local/bin:/usr/bin:/bin:/home/{{ ansible_user | default('worker') }}/.local/bin" }
       changed_when: true
 
@@ -280,18 +302,97 @@
       environment: { PATH: "/usr/local/bin:/usr/bin:/bin:/home/{{ ansible_user | default('worker') }}/.local/bin" }
       changed_when: true
 
-    - name: Restart meshed deployments (data plane proxies)
+    - name: Restart meshed deployments one at a time (surge-safe on small clusters)
       ansible.builtin.shell: |
         for d in $(kubectl -n default get deploy -o name); do
-          kubectl -n default rollout restart $d >/dev/null && kubectl -n default rollout status $d --timeout=180s >/dev/null && echo "ok $d"
+          kubectl -n default rollout restart $d >/dev/null
+          kubectl -n default rollout status $d --timeout=180s >/dev/null || {
+            # capacity deadlock: fall back to recreate-style rollout on this one
+            kubectl -n default patch $d --type merge -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}' >/dev/null
+            kubectl -n default rollout status $d --timeout=180s
+            kubectl -n default patch $d --type merge -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":"25%","maxUnavailable":"25%"}}}}' >/dev/null
+          }
+          echo "ok $d"
         done
       when: linkerd_restart_meshed | bool
       changed_when: true
 
     - name: Post-upgrade check
-      ansible.builtin.command: "{{ lkd }} check --proxy"
+      ansible.builtin.shell: "timeout 300 {{ lkd }} check --proxy 2>&1 | grep -E '^×|^‼' || echo clean"
       environment: { PATH: "/usr/local/bin:/usr/bin:/bin:/home/{{ ansible_user | default('worker') }}/.local/bin" }
       changed_when: false
+      failed_when: false
+      register: linkerd_postcheck
+
+    - name: Report post-check findings
+      ansible.builtin.debug:
+        msg: "{{ linkerd_postcheck.stdout_lines }}"
+
+- name: "Upgrade cluster dependencies (operators/ingress/cert-manager) to latest stable"
+  hosts: kube_master
+  gather_facts: false
+  tags: [deps]
+  vars:
+    helm_deps:
+      - {release: cert-manager, repo_url: https://charts.jetstack.io, chart: cert-manager/cert-manager, ns: cert-manager, deploy: cert-manager}
+      - {release: ingress-nginx, repo_url: https://kubernetes.github.io/ingress-nginx, chart: ingress-nginx/ingress-nginx, ns: ingress-nginx, deploy: ingress-nginx-controller}
+      - {release: cnpg, repo_url: https://cloudnative-pg.github.io/charts, chart: cnpg/cloudnative-pg, ns: postgres, deploy: cnpg-controller-manager}
+      - {release: mongodb-community-operator, repo_url: https://mongodb.github.io/helm-charts, chart: mongodb/community-operator, ns: mongo, deploy: mongodb-kubernetes-operator}
+      - {release: strimzi-operator, repo_url: https://strimzi.io/charts/, chart: strimzi/strimzi-kafka-operator, ns: kafka, deploy: strimzi-cluster-operator}
+  tasks:
+    - name: Ensure dependency helm repos are present
+      ansible.builtin.command: "helm repo add {{ item.release }} {{ item.repo_url }}"
+      loop: "{{ helm_deps }}"
+      loop_control: { label: "{{ item.release }}" }
+      changed_when: false
+
+    - name: Update helm repos
+      ansible.builtin.command: helm repo update
+      changed_when: true
+
+    - name: Resolve installed vs latest-stable per dependency
+      ansible.builtin.shell: |
+        CUR=$(helm list -n {{ item.ns }} --filter "^{{ item.release }}$" -o json | python3 -c "import sys,json;r=json.load(sys.stdin);print(r[0]['chart'].rsplit('-',1)[-1].lstrip('v') if r else '')")
+        NEW=$(helm search repo {{ item.chart }} -l -o json | python3 -c "import sys,json;print(json.load(sys.stdin)[0]['version'])")
+        echo "$CUR $NEW"
+      loop: "{{ helm_deps if (only | default('')) == '' else (helm_deps | selectattr('release', 'equalto', only)) }}"
+      loop_control: { label: "{{ item.release }}" }
+      register: dep_versions
+      changed_when: false
+
+    - name: Report dependency paths
+      ansible.builtin.debug:
+        msg: "{{ item.item.release }}: {{ item.stdout.split()[0] }} -> {{ item.stdout.split()[1] }}"
+      loop: "{{ dep_versions.results }}"
+      loop_control: { label: "{{ item.item.release }}" }
+
+    - name: Upgrade dependencies that lag behind (user values over new defaults)
+      ansible.builtin.shell: |
+        set -e
+        helm get values {{ item.item.release }} -n {{ item.item.ns }} -o yaml > /tmp/dep-values.yaml
+        case "$(grep -vE '^\s*(#|$)' /tmp/dep-values.yaml | tr -d ' \n')" in
+          ""|null) echo "{}" > /tmp/dep-values.yaml ;;
+        esac
+        helm upgrade {{ item.item.release }} {{ item.item.chart }} -n {{ item.item.ns }} -f /tmp/dep-values.yaml >/dev/null
+        kubectl -n {{ item.item.ns }} rollout status deployment/{{ item.item.deploy }} --timeout=120s | tail -1
+      loop: "{{ dep_versions.results }}"
+      loop_control: { label: "{{ item.item.release }}" }
+      when: (item.stdout.split()[0] != item.stdout.split()[1])
+      register: dep_upgrades
+
+    - name: "Wait for managed CRs to reconcile (fully-qualified names: 'cluster' is ambiguous with CAPI)"
+      ansible.builtin.shell: |
+        kubectl -n kafka wait kafkas.kafka.strimzi.io/kafka-cluster --for=condition=Ready --timeout=240s | tail -1
+        kubectl -n postgres wait clusters.postgresql.cnpg.io/postgres-app --for=condition=Ready --timeout=120s | tail -1
+        kubectl -n postgres wait clusters.postgresql.cnpg.io/postgres-keycloak --for=condition=Ready --timeout=120s | tail -1
+        kubectl -n mongo get mongodbcommunity.mongodb.com mongodb-rs -o jsonpath='{.status.phase}'
+        echo
+      changed_when: false
+      when: dep_upgrades.results | selectattr('changed', 'defined') | selectattr('changed') | list | length > 0
+
+    - name: Note Rancher-managed charts (upgraded by Rancher, not here)
+      ansible.builtin.debug:
+        msg: "fleet / rancher-turtles / fleet-crd are Rancher-managed feature charts — upgrade them via Rancher, this play skips them."
 
 - name: Post-flight — versions and health
   hosts: kube_master

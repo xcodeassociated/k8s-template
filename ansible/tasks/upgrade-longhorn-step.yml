@@ -1,6 +1,9 @@
 # One Longhorn minor step (step = chart version string). Longhorn only supports
 # upgrading one minor at a time (the chart pre-upgrade job blocks skipping).
-# Engines are live-upgraded after each step when longhorn_live_upgrade is true.
+# Values are user-values merged over the NEW chart's defaults — never
+# --reuse-values: it replays the OLD chart's value schema (freezes image tags
+# at the old version / breaks on renamed keys). Engines are live-upgraded
+# after each step when longhorn_live_upgrade is true.
 
 - name: Dump user-supplied values (merged over the new chart's defaults)
   ansible.builtin.shell: |
@@ -28,21 +31,30 @@
   when: longhorn_step is not skipped
   changed_when: false
 
+- name: Wait for the v{{ step }} engine image to be ready on all nodes
+  ansible.builtin.shell: |
+    kubectl -n longhorn-system get engineimages -o json |
+    python3 -c "import sys,json; ei=[e for e in json.load(sys.stdin)['items'] if e['spec'].get('image','').endswith('longhorn-engine:v{{ step }}')]; print('ready' if ei and all(c.get('status')=='True' and c.get('type')=='ready' for e in ei for c in e.get('status',{}).get('conditions',[])) else 'waiting')"
+  register: lh_ei
+  until: lh_ei.stdout == 'ready'
+  retries: 24
+  delay: 10
+  changed_when: false
+  when: longhorn_step is not skipped
+
 - name: List volumes (for engine live-upgrade)
   ansible.builtin.shell: kubectl -n longhorn-system get volumes -o jsonpath='{.items[*].metadata.name}'
   register: lh_vols
   changed_when: false
-  check_mode: false
   when: longhorn_live_upgrade | bool and longhorn_step is not skipped
 
 - name: Live-upgrade volume engines to v{{ step }}
   ansible.builtin.command: >-
     kubectl -n longhorn-system patch volume {{ item }} --type merge
-    -p '{"spec":{"image":"longhornio/longhorn-engine:v{{ step }}"}}'
+    -p '{"spec":{"image":"docker.io/longhornio/longhorn-engine:v{{ step }}"}}'
   loop: "{{ lh_vols.stdout | default('') | split(' ') }}"
   when: longhorn_live_upgrade | bool and longhorn_step is not skipped
   register: lh_engines
-  failed_when: false
 
 - name: Wait for volumes healthy after engine upgrade
   ansible.builtin.shell: |
@@ -53,3 +65,4 @@
   delay: 10
   changed_when: false
   when: longhorn_live_upgrade | bool and longhorn_step is not skipped
+  failed_when: lh_healthy.stdout is defined and (lh_healthy.stdout | int) > 0 and lh_healthy.attempts >= 30

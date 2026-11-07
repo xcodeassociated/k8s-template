@@ -152,7 +152,7 @@ Upgrades Rancher → Longhorn → k3s → Linkerd (order per official docs, rese
 - **Linkerd**: stays on **edge** (stable 2.20's k8s ceiling < k3s 1.37). Installs latest edge CLI on the master, `linkerd upgrade --crds` + `linkerd upgrade` (retains cluster TLS/config), re-installs viz through the same `sed` that sets the customized `-enforced-host=.*$`, prunes, restarts meshed deployments in `default`, then `linkerd check --proxy`.
 - Pre-step: Keycloak backup (`--skip-tags backup` to omit). Take a k3s snapshot first for real runs: `sudo k3s etcd-snapshot save` on the master.
 
-Verified: syntax + full `--check` dry run + live version report. As of 2026-11-07 the components are outdated — Rancher v2.13.3 (latest 2.15.3), Longhorn v1.11.1 (latest 1.13.0), Linkerd edge-26.3.3 (latest edge ~26.11), k3s v1.37.2+k3s1 = latest stable (no-op). ⚠️ k3s 1.37 is above the certified Kubernetes ceiling of every released Rancher (2.15.x supports ≤1.36) — works, but outside the support matrix until Rancher 2.16.
+Verified: syntax + full `--check` dry run + live version report. Real run 2026-11-07: Longhorn 1.11.1→1.13.0 ✅ (watch the `--reuse-values` trap — use the values-file merge), k3s converged, Linkerd edge-26.3.3→edge-26.11.1 ✅ (pass live identity files to `linkerd upgrade` if the install-config issuer is stale after cert rotation). ⚠️ Rancher upgrade is **hard-blocked while k3s > Rancher's certified ceiling**: charts enforce `kubeVersion < 1.36` (2.14.x) / `< 1.37` (2.15.x), so on k3s 1.37 every released chart refuses the upgrade — Rancher stays on 2.13.3 until 2.16 ships. Do not bypass with `--kube-version`.
 
 ## Gotchas
 

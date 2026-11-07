@@ -65,6 +65,10 @@ Keycloak. Remove them together with the features that reference them.
     └── 05-react-typescript-template.yaml    # frontend
 ```
 
+Also: `scripts/` (Keycloak backup/restore/realm-fix helpers, see AGENTS.md) and `ansible/` (inventory + cluster shutdown, startup, OS-update, and component-upgrade playbooks).
+
+App end-user login credentials (for UI/Playwright checks) go in repo-root `.credential` — copy `.credential.template` and fill it; `.credential` is gitignored.
+
 Conventions:
 
 - Each app file is a self-contained bundle: `ConfigMap` (non-secret config) +
@@ -219,7 +223,10 @@ kubectl rollout status deployment/react-typescript-template
 ## Cleanup
 
 Cleanup is destructive — back up data before deleting databases, Kafka volumes,
-namespaces, or PVCs. Delete in reverse order:
+namespaces, or PVCs. Delete in reverse order. When wiping before a redeploy, wait
+until the objects and PVCs are actually gone before applying — deleting with
+`--wait=false` and re-applying immediately can cancel the deletion mid-terminate,
+leaving old databases/volumes intact behind `Terminating` PVCs.
 
 ```bash
 kubectl delete -f apps/05-react-typescript-template.yaml --ignore-not-found
@@ -245,10 +252,78 @@ helm uninstall cnpg -n postgres || true
 Finally delete namespaces (`kubectl delete -f dependencies/00-namespaces.yaml`)
 and inspect leftover volumes with `kubectl get pvc -A && kubectl get pv`.
 
+## Graceful cluster shutdown (Proxmox VMs)
+
+If the cluster runs on VMs you power on/off on demand, stop it with the Ansible
+playbook instead of yanking power — it backs up Keycloak, then shuts down
+workers first and the master last so systemd stops k3s cleanly (pods terminated,
+Longhorn volumes detached, CNPG checkpointed) and nothing errors on next boot:
+
+```bash
+ansible-playbook -i ansible/inventory.ini ansible/shutdown-cluster.yml
+# --skip-tags backup  → no Keycloak backup | --tags workers → master stays up
+```
+
+Backups land in `keycloak-realm/<host>/` (gitignored). Workers shut down in
+parallel (each guest still stops k3s/Longhorn/CNPG cleanly via systemd), the
+master last; the playbook then polls the
+Proxmox API until every kube VM reports `stopped`. After powering the VMs
+back on, run the verification steps above; if `GET /external/1` on either
+backend returns `{"data":"FALLBACK"}`, run `scripts/fix-keycloak-service-clients.sh`.
+
+Both playbooks are non-destructive — they only stop/start VMs and wait.
+
+Bring everything back up and to fully-serving state with:
+
+```bash
+ansible-playbook -i ansible/inventory.ini ansible/startup-cluster.yml
+# the Proxmox host (p0b.lan) is already in the inventory; to also power the VMs
+# on automatically, copy ansible/group_vars/all/pve.yml.template to pve.yml and
+# fill in pve_user/pve_password — otherwise start them in the UI first
+```
+
+The startup playbook waits through nodes → Longhorn → CNPG/Kafka/Mongo → app
+rollouts, self-heals the Keycloak service-account clients if needed, and ends
+with an HTTP report of all endpoints. The bring-up/check logic is verified on a
+running cluster, as is the Proxmox ticket auth + VM listing (`p0b.lan`); only
+the actual `status/start` call runs for the first time on a real power-off →
+on cycle.
+
+### OS updates on the VMs
+
+```bash
+ansible-playbook -i ansible/inventory.ini ansible/update-os.yml
+# --check for a dry run with pending-upgrade counts
+```
+
+`apt full-upgrade` on all four Ubuntu 22.04 guests in parallel. **No reboot by
+default** — kernel updates are installed and a pending reboot is reported;
+add `-e reboot_after_update=true` to also reboot the nodes that need it (all
+at once, ~2–3 min cluster-wide pause, then the playbook waits for every node
+to return to `Ready`). Re-running after an interrupted run is safe (orphaned
+apt is waited out).
+
+### Cluster component upgrades
+
+```bash
+ansible-playbook -i ansible/inventory.ini ansible/update-cluster.yml
+# --tags report → current versions only | --check → dry run
+```
+
+Upgrades Rancher (stepwise per minor — skipping is unsupported), then Longhorn
+(one minor at a time with engine live-upgrades), then k3s (via the existing
+system-upgrade-controller stable-channel plans) and Linkerd (channel-matched
+CLI → control plane → viz → prune → proxy restarts). **No version numbers are
+ever needed** — installed and target versions are discovered at runtime from
+`helm list` / `helm search repo --versions` / the channel URL. Order and
+procedures follow the official docs; details and support-matrix caveats are in
+`AGENTS.md`. Take a k3s snapshot (`sudo k3s etcd-snapshot save`) before a real
+run.
+
 ## Public repository checklist
 
 - Keep `dependencies/01-secrets.template.yaml` and `apps/01-secrets.template.yaml` placeholders only.
-- Keep local `**/*secrets.yaml` files ignored and private.
+- Keep local `**/*secrets.yaml` files, `.credential`, and `keycloak-realm/` backups ignored and private.
 - Do not commit kubeconfigs, certificates with private keys, tokens, or `.env` files.
 - Run a secret scan before publishing the repository.
 - Review hard-coded domains, image names, storage sizes, and ingress settings

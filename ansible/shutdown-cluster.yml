@@ -1,0 +1,152 @@
+---
+# Gracefully shut down the whole k3s cluster with no k8s/Rancher corruption.
+#
+#   ansible-playbook -i ansible/inventory.ini ansible/shutdown-cluster.yml
+#   skip the Keycloak backup:  --skip-tags backup
+#   only workers (master stays up):  --tags workers
+#
+# Order: backup (everything still running) -> workers (all at once) -> master.
+# `shutdown -h now` lets systemd stop k3s cleanly (pods terminated, Longhorn
+# volumes detached, CNPG checkpoints), which is what prevents errors on boot.
+# All workers are triggered in parallel; the final Proxmox verify play waits
+# for every guest to actually reach power-off before the master is stopped.
+# Requires: passwordless SSH as worker, passwordless sudo, repo cloned at
+# /home/worker/k8s-template on the master (for the backup step).
+
+- name: Pre-shutdown Keycloak backup (optional)
+  hosts: kube_master
+  tags: [backup]
+  vars:
+    repo_dir: /home/worker/k8s-template
+  tasks:
+    - name: Check repo + backup script exist
+      ansible.builtin.stat:
+        path: "{{ repo_dir }}/scripts/backup-keycloak.sh"
+      register: backup_script
+
+    - name: Run Keycloak backup (realm JSON + both DB dumps)
+      ansible.builtin.command: "bash {{ repo_dir }}/scripts/backup-keycloak.sh"
+      when: backup_script.stat.exists
+      register: backup_out
+      changed_when: true
+
+    - name: Warn if script missing
+      ansible.builtin.debug:
+        msg: "SKIP backup: {{ repo_dir }}/scripts/backup-keycloak.sh not found on master"
+      when: not backup_script.stat.exists
+
+    - name: Fetch backups to controller (repo keycloak-realm/<host>/)
+      ansible.builtin.fetch:
+        src: "{{ repo_dir }}/keycloak-realm/{{ item }}"
+        dest: "{{ playbook_dir }}/../keycloak-realm/{{ inventory_hostname }}/"
+        flat: true
+      loop: [app-realm.json, backup-keycloak.dump, backup-application.dump]
+      when: backup_script.stat.exists
+
+    - name: Cluster health snapshot before shutdown
+      ansible.builtin.command: kubectl get pods -A --no-headers
+      register: pods
+      changed_when: false
+      failed_when: false
+
+    - name: Report non-running pods
+      ansible.builtin.debug:
+        msg: "{{ pods.stdout_lines | reject('search', 'Running|Completed') | list }}"
+
+- name: Shut down worker nodes first (all at once)
+  hosts: kube_workers
+  gather_facts: false
+  become: true
+  tags: [workers]
+  tasks:
+    - name: Graceful shutdown
+      ansible.builtin.shell: "sleep 1 && /sbin/shutdown -h now"
+      async: 10
+      poll: 0
+      ignore_unreachable: true
+
+    - name: Wait until VM is fully off
+      ansible.builtin.wait_for:
+        host: "{{ inventory_hostname }}"
+        port: 22
+        state: stopped
+        timeout: 240
+      delegate_to: localhost   # check from the controller — the VM can't serve SSH mid-shutdown
+      become: false
+
+- name: Wait for worker power-off before touching the master (Proxmox API)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [verify]
+  tasks:
+    - name: Poll Proxmox until no WORKER kube VM reports running
+      ansible.builtin.shell: |
+        set -e
+        TICKET=$(curl -sk -m 10 -X POST https://{{ pve_host }}:8006/api2/json/access/ticket \
+          --data-urlencode "username={{ pve_user | default('root@pam') }}" \
+          --data-urlencode "password={{ pve_password | default('') }}" |
+          python3 -c "import sys,json;print(json.load(sys.stdin)['data']['ticket'])")
+        for N in $(curl -sk -m 10 -b "PVEAuthCookie=$TICKET" https://{{ pve_host }}:8006/api2/json/nodes |
+                   python3 -c "import sys,json;[print(n['node']) for n in json.load(sys.stdin)['data']]"); do
+          curl -sk -m 10 -b "PVEAuthCookie=$TICKET" "https://{{ pve_host }}:8006/api2/json/nodes/$N/qemu" |
+            python3 -c "import sys,json;[print(f\"{r['name']}={r['status']}\") for r in json.load(sys.stdin)['data'] if r['name'].startswith('vm-kube-') and r['name'] != 'vm-{{ groups.kube_master[0].split('.')[0] }}']"
+        done
+      register: pve_workers
+      until: pve_workers.stdout_lines | select('search', '=running') | list | length == 0
+      retries: 24
+      delay: 15
+      changed_when: false
+      no_log: true
+      when: (pve_host | default('', true) | length > 0) and (pve_password | default('', true) | length > 0)
+
+- name: Shut down the master last
+  hosts: kube_master
+  gather_facts: false
+  become: true
+  tags: [master]
+  tasks:
+    - name: Graceful shutdown
+      ansible.builtin.shell: "sleep 1 && /sbin/shutdown -h now"
+      async: 10
+      poll: 0
+      ignore_unreachable: true
+
+    - name: Wait until VM is fully off
+      ansible.builtin.wait_for:
+        host: "{{ inventory_hostname }}"
+        port: 22
+        state: stopped
+        timeout: 240
+      delegate_to: localhost   # check from the controller — the VM can't serve SSH mid-shutdown
+      become: false
+
+- name: Confirm every kube VM actually reached power-off (Proxmox API)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [verify]
+  tasks:
+    - name: Poll Proxmox until no kube VM reports running
+      ansible.builtin.shell: |
+        set -e
+        TICKET=$(curl -sk -m 10 -X POST https://{{ pve_host }}:8006/api2/json/access/ticket \
+          --data-urlencode "username={{ pve_user | default('root@pam') }}" \
+          --data-urlencode "password={{ pve_password | default('') }}" |
+          python3 -c "import sys,json;print(json.load(sys.stdin)['data']['ticket'])")
+        for N in $(curl -sk -m 10 -b "PVEAuthCookie=$TICKET" https://{{ pve_host }}:8006/api2/json/nodes |
+                   python3 -c "import sys,json;[print(n['node']) for n in json.load(sys.stdin)['data']]"); do
+          curl -sk -m 10 -b "PVEAuthCookie=$TICKET" "https://{{ pve_host }}:8006/api2/json/nodes/$N/qemu" |
+            python3 -c "import sys,json;[print(f\"{r['name']}={r['status']}\") for r in json.load(sys.stdin)['data'] if 'kube' in r['name']]"
+        done
+      register: pve_state
+      until: pve_state.stdout_lines | select('search', '=running') | list | length == 0
+      retries: 24
+      delay: 15
+      changed_when: false
+      no_log: true
+      when: (pve_host | default('', true) | length > 0) and (pve_password | default('', true) | length > 0)
+
+    - name: Report final VM states
+      ansible.builtin.debug:
+        msg: "{{ pve_state.stdout_lines | default(['(Proxmox credentials not set — skipped power-off verification)']) }}"

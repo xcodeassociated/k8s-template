@@ -9,6 +9,12 @@
 !.env.template
 !.env.*.template
 
+# Local app user credentials (copy .credential.template to .credential)
+.credential
+
+# Proxmox API token for the startup playbook (copy the template; never commit)
+ansible/group_vars/all/pve.yml
+
 # Local/private Kubernetes secrets
 **/*secrets.yaml
 **/*secrets.local.yaml
@@ -29,5 +35,8 @@ kubeconfig
 # Local generated files and scratch data
 volumes/
 tmp/
+.playwright-mcp/
+# Local realm/DB backups (exported from prod; contain secrets) — never commit
+keycloak-realm/
 *.tmp
 *.bak

@@ -1,0 +1,23 @@
+---
+# OS (apt) update of the k3s cluster VMs — ALL NODES AT ONCE.
+#
+#   ansible-playbook -i ansible/inventory.ini ansible/update-os.yml
+#   dry run (no changes/reboots, shows pending counts): --check
+#   single node:  -l kube-1.lan   |   workers only: -l 'kube_workers,!kube_master'
+#
+# Every node runs apt full-upgrade in parallel. Reboot is OFF by default —
+# pass -e reboot_after_update=true to reboot nodes that need it
+# (/var/run/reboot-required); otherwise a pending reboot is just reported.
+# When rebooting: all nodes reboot simultaneously (~2-3 min full cluster
+# outage — accepted trade-off for speed), then the playbook waits for the k3s
+# service and the node back Ready. Non-destructive otherwise: no config or
+# cluster-resource changes.
+
+- name: Update OS on all nodes (parallel)
+  hosts: kube_nodes
+  gather_facts: false
+  become: true
+  vars:
+    k3s_service: "{{ 'k3s' if inventory_hostname in groups['kube_master'] else 'k3s-agent' }}"
+  tasks:
+    - import_tasks: tasks/update-node.yml

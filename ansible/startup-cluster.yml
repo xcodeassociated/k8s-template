@@ -1,0 +1,225 @@
+---
+# Start the cluster VMs and bring everything back to fully-serving state.
+#
+#   ansible-playbook -i ansible/inventory.ini ansible/startup-cluster.yml
+#
+# Power-on options:
+#   1. Proxmox API (pve_host is set in the inventory to p0b.lan): put credentials
+#      in ansible/group_vars/all/pve.yml (copy pve.yml.template, gitignored):
+#        pve_user: 'root@pam'
+#        pve_password: '...'
+#      VMs are found by name matching vm-kube-*; kube-0 starts first.
+#   2. No credentials (or -e pve_host=''): start the VMs in the Proxmox UI, then
+#      run this playbook — the power-on tasks skip and it waits for the nodes.
+#
+# Bring-up order handled here: SSH -> nodes Ready -> Longhorn volumes ->
+# operators (CNPG/Kafka/Mongo) -> app rollouts -> /external self-heal -> URLs.
+# Nothing is created or deleted; this only waits and repairs service-account
+# clients if the realm was regenerated between sessions.
+
+- name: Power on the VMs via Proxmox (skipped without credentials)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [poweron]
+  vars:
+    # pve_host comes from inventory; pve_user/pve_password from
+    # group_vars/all/pve.yml (gitignored). Auth = ticket flow via curl, because
+    # the uri module's Python is blocked by macOS firewall and root@pam cannot
+    # use API tokens without privilege separation.
+    poweron_enabled: "{{ (pve_host | default('', true) | length > 0) and (pve_password | default('', true) | length > 0) }}"
+  tasks:
+    - name: Get Proxmox auth ticket
+      ansible.builtin.command:
+        argv:
+          - curl
+          - -sk
+          - -m
+          - "15"
+          - -X
+          - POST
+          - "https://{{ pve_host }}:8006/api2/json/access/ticket"
+          - --data-urlencode
+          - "username={{ pve_user | default('root@pam') }}"
+          - --data-urlencode
+          - "password={{ pve_password | default('') }}"
+      register: pve_ticket_raw
+      changed_when: false
+      no_log: true
+      when: poweron_enabled
+
+    - name: Parse ticket
+      ansible.builtin.set_fact:
+        pve_ticket: "{{ (pve_ticket_raw.stdout | from_json).data.ticket }}"
+        pve_csrf: "{{ (pve_ticket_raw.stdout | from_json).data.CSRFPreventionToken }}"
+      no_log: true
+      when: poweron_enabled
+
+    - name: List Proxmox nodes
+      ansible.builtin.command:
+        argv:
+          - curl
+          - -sk
+          - -m
+          - "15"
+          - -b
+          - "PVEAuthCookie={{ pve_ticket }}"
+          - "https://{{ pve_host }}:8006/api2/json/nodes"
+      register: pve_nodes_raw
+      changed_when: false
+      when: poweron_enabled
+
+    - name: List VMs per node
+      ansible.builtin.command:
+        argv:
+          - curl
+          - -sk
+          - -m
+          - "15"
+          - -b
+          - "PVEAuthCookie={{ pve_ticket }}"
+          - "https://{{ pve_host }}:8006/api2/json/nodes/{{ item.node }}/qemu"
+      loop: "{{ (pve_nodes_raw.stdout | from_json).data }}"
+      loop_control: { label: "{{ item.node }}" }
+      register: pve_vms_raw
+      changed_when: false
+      when: poweron_enabled
+
+    - name: Collect kube VMs (node + status per VM)
+      ansible.builtin.set_fact:
+        pve_all_vms: >-
+          {{ pve_all_vms | default([])
+             + [{'node': item.item.node,
+                 'vms': (item.stdout | from_json).data}] }}
+      loop: "{{ pve_vms_raw.results | default([]) }}"
+      loop_control: { label: "{{ item.item.node }}" }
+      when: poweron_enabled
+
+    - name: Start kube VMs (kube-0 first, then workers)
+      ansible.builtin.command:
+        argv:
+          - curl
+          - -sk
+          - -m
+          - "30"
+          - -b
+          - "PVEAuthCookie={{ pve_ticket }}"
+          - -H
+          - "CSRFPreventionToken: {{ pve_csrf }}"
+          - -X
+          - POST
+          - "https://{{ pve_host }}:8006/api2/json/nodes/{{ item.0.node }}/qemu/{{ item.1.vmid }}/status/start"
+      vars:
+        kube_vms: >-
+          {{ pve_all_vms | default([]) | subelements('vms')
+             | selectattr('1.name', 'match', 'vm-kube-')
+             | rejectattr('1.status', 'equalto', 'running')
+             | sort(attribute='1.name') | list }}
+      loop: "{{ kube_vms }}"
+      loop_control: { label: "{{ item.1.name }} (vmid {{ item.1.vmid }})" }
+      changed_when: true
+      when: poweron_enabled
+
+    - name: No Proxmox credentials — expecting VMs already started manually
+      ansible.builtin.debug:
+        msg: "Proxmox power-on skipped (need pve_user/pve_password in ansible/group_vars/all/pve.yml); continuing to wait for SSH (start VMs in Proxmox UI if they are off)"
+      when: not poweron_enabled
+
+- name: Wait for SSH on all nodes
+  hosts: kube_nodes
+  gather_facts: false
+  tags: [wait]
+  tasks:
+    - name: Wait for SSH port
+      ansible.builtin.wait_for:
+        host: "{{ inventory_hostname }}"
+        port: 22
+        state: started
+        timeout: 420
+      delegate_to: localhost   # booting VMs can't run the check themselves
+      become: false
+
+- name: Bring the cluster back to serving state
+  hosts: kube_master
+  gather_facts: false
+  tags: [ready]
+  vars:
+    repo_dir: /home/worker/k8s-template
+  tasks:
+    - name: Wait for all 4 nodes Ready
+      ansible.builtin.shell: kubectl get nodes --no-headers | grep -c ' Ready'
+      register: ready
+      until: (ready.stdout | int) >= 4
+      retries: 24
+      delay: 10
+      changed_when: false
+
+    - name: Wait for Longhorn volumes healthy (attached + not faulted)
+      ansible.builtin.shell: |
+        kubectl -n longhorn-system get volumes -o jsonpath='{range .items[*]}{.status.conditions.Scheduled}{"\n"}{end}' 2>/dev/null | grep -c false || true
+      register: lh_bad
+      until: (lh_bad.stdout | default('0') | int) == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Wait for CNPG clusters healthy
+      ansible.builtin.command: kubectl -n postgres get clusters.postgresql.cnpg.io --no-headers
+      register: cnpg
+      until: (cnpg.stdout_lines | select('search', 'healthy') | list | list | length) >= 2
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Wait for Kafka + Mongo + grafana pods Running
+      ansible.builtin.shell: kubectl get pods -A --no-headers | grep -E "^(kafka|mongo|grafana) " | grep -vcE "Running|Completed" || true
+      register: deps_bad
+      until: (deps_bad.stdout | int) == 0
+      retries: 40
+      delay: 10
+      changed_when: false
+
+    - name: Wait for app deployments Ready
+      ansible.builtin.shell: kubectl -n default get deploy --no-headers | grep -vE "1/1" | wc -l
+      register: apps_bad
+      until: (apps_bad.stdout | int) == 0
+      retries: 36
+      delay: 10
+      changed_when: false
+
+    - name: Check /external on both backends
+      ansible.builtin.shell: |
+        T=$(curl -s -m 8 -d "client_id=frontend" -d "username=user" -d "password=user" -d "grant_type=password" https://auth.softeno.dev/realms/app/protocol/openid-connect/token | python3 -c "import sys,json;print(json.load(sys.stdin).get('access_token',''))")
+        M=$(curl -s -m 8 -H "Authorization: Bearer $T" https://api.softeno.dev/spring-reactive-template/external/1)
+        R=$(curl -s -m 8 -H "Authorization: Bearer $T" https://api.softeno.dev/spring-reactive-r2dbc-template/external/1)
+        echo "$M $R"
+      register: ext
+      changed_when: false
+
+    - name: Self-heal service-account clients if FALLBACK
+      ansible.builtin.command: bash {{ repo_dir }}/scripts/fix-keycloak-service-clients.sh
+      when: "'FALLBACK' in ext.stdout"
+      register: heal
+      changed_when: true
+
+    - name: Re-check /external after heal
+      ansible.builtin.shell: |
+        T=$(curl -s -m 8 -d "client_id=frontend" -d "username=user" -d "password=user" -d "grant_type=password" https://auth.softeno.dev/realms/app/protocol/openid-connect/token | python3 -c "import sys,json;print(json.load(sys.stdin).get('access_token',''))")
+        echo "$(curl -s -m 8 -H "Authorization: Bearer $T" https://api.softeno.dev/spring-reactive-template/external/1) $(curl -s -m 8 -H "Authorization: Bearer $T" https://api.softeno.dev/spring-reactive-r2dbc-template/external/1)"
+      register: ext2
+      when: heal is not skipped
+      changed_when: false
+
+    - name: Final URL check
+      ansible.builtin.shell: |
+        for u in https://app.softeno.dev https://auth.softeno.dev/realms/app https://api.softeno.dev/spring-reactive-template/swagger-ui/index.html; do
+          echo "$u -> $(curl -sk -o /dev/null -w '%{http_code}' -m 5 -L $u)"; done
+      register: urls
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          external={{ ext2.stdout | default(ext.stdout) }}
+          urls={{ urls.stdout_lines }}
+          healed={{ heal is not skipped }}

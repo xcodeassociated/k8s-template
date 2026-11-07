@@ -1,0 +1,5 @@
+# Copy to ansible/group_vars/all/pve.yml (gitignored — contains credentials)
+# and fill in. Used by startup-cluster.yml to power the VMs on via the Proxmox
+# API (ticket auth; root@pam cannot use API tokens without privilege separation).
+pve_user: 'root@pam'
+pve_password: 'CHANGE-ME'

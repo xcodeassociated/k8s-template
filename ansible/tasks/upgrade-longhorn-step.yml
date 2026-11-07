@@ -1,0 +1,47 @@
+# One Longhorn minor step (step = chart version string). Longhorn only supports
+# upgrading one minor at a time (the chart pre-upgrade job blocks skipping).
+# Engines are live-upgraded after each step when longhorn_live_upgrade is true.
+
+- name: "Upgrade Longhorn chart to {{ step }}"
+  ansible.builtin.command: >-
+    helm upgrade longhorn longhorn/longhorn --namespace longhorn-system
+    --version {{ step }} --reuse-values
+  when: step != lh_installed.stdout
+  register: longhorn_step
+
+- name: Wait for longhorn-manager daemonset
+  ansible.builtin.command: kubectl -n longhorn-system rollout status daemonset/longhorn-manager --timeout=600s
+  when: longhorn_step is not skipped
+  changed_when: false
+
+- name: Wait for driver-deployer and UI
+  ansible.builtin.command: "kubectl -n longhorn-system rollout status deployment/{{ item }} --timeout=300s"
+  loop: [longhorn-driver-deployer, longhorn-ui]
+  when: longhorn_step is not skipped
+  changed_when: false
+
+- name: List volumes (for engine live-upgrade)
+  ansible.builtin.shell: kubectl -n longhorn-system get volumes -o jsonpath='{.items[*].metadata.name}'
+  register: lh_vols
+  changed_when: false
+  check_mode: false
+  when: longhorn_live_upgrade | bool and longhorn_step is not skipped
+
+- name: Live-upgrade volume engines to v{{ step }}
+  ansible.builtin.command: >-
+    kubectl -n longhorn-system patch volume {{ item }} --type merge
+    -p '{"spec":{"image":"longhornio/longhorn-engine:v{{ step }}"}}'
+  loop: "{{ lh_vols.stdout | default('') | split(' ') }}"
+  when: longhorn_live_upgrade | bool and longhorn_step is not skipped
+  register: lh_engines
+  failed_when: false
+
+- name: Wait for volumes healthy after engine upgrade
+  ansible.builtin.shell: |
+    kubectl -n longhorn-system get volumes -o jsonpath='{range .items[*]}{.status.robustness}{"\n"}{end}' | grep -vc healthy || true
+  register: lh_healthy
+  until: (lh_healthy.stdout | int) == 0
+  retries: 30
+  delay: 10
+  changed_when: false
+  when: longhorn_live_upgrade | bool and longhorn_step is not skipped

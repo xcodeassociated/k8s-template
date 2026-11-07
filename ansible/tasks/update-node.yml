@@ -1,0 +1,70 @@
+# Shared per-node OS update flow, imported by update-os.yml (do not run alone).
+# Assumes: become: true and k3s_service defined by the importing play.
+# Reboot detection relies on update-notifier-common (stock on Ubuntu 22.04).
+
+- name: Wait for any other apt/dpkg to finish (e.g. orphaned from a killed run)
+  ansible.builtin.shell: pgrep -x apt || pgrep -x dpkg || true
+  register: apt_busy
+  until: apt_busy.stdout | trim == ''
+  retries: 40
+  delay: 10
+  changed_when: false
+  check_mode: false
+
+- name: Refresh apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: List pending upgrades
+  ansible.builtin.shell: apt list --upgradable 2>/dev/null | grep -c upgradable || true
+  register: pending_upgrades
+  changed_when: false
+  check_mode: false
+
+- name: Report pending upgrades
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: {{ pending_upgrades.stdout }} package(s) upgradable"
+
+- name: Apply all upgrades (full-upgrade + autoremove)
+  ansible.builtin.apt:
+    upgrade: full
+    autoremove: true
+    autoclean: true
+
+- name: Check if a reboot is required
+  ansible.builtin.stat:
+    path: /var/run/reboot-required
+  register: reboot_required
+
+- name: Reboot (only when enabled via -e reboot_after_update=true)
+  ansible.builtin.reboot:
+    reboot_timeout: 300
+    msg: "OS update reboot (ansible/update-os.yml)"
+  when: reboot_required.stat.exists and reboot_after_update | default(false) | bool
+
+- name: Note pending reboot (reboot disabled by default)
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: kernel/critical updates installed — NOT rebooting (default). Reboot later or run with -e reboot_after_update=true"
+  when: reboot_required.stat.exists and not (reboot_after_update | default(false) | bool)
+
+- name: Ensure k3s service is running
+  ansible.builtin.systemd:
+    name: "{{ k3s_service }}"
+    state: started
+
+- name: Verify k3s service is active
+  ansible.builtin.command: systemctl is-active {{ k3s_service }}
+  register: k3s_active
+  retries: 6
+  delay: 10
+  until: k3s_active.stdout == 'active'
+  changed_when: false
+  check_mode: false
+
+# Node objects are named vm-kube-N (not the inventory hostname).
+- name: Verify node is Ready again
+  ansible.builtin.command: kubectl wait --for=condition=Ready node/vm-{{ inventory_hostname_short }} --timeout=180s
+  delegate_to: "{{ groups.kube_master[0] }}"
+  changed_when: false
+  check_mode: false

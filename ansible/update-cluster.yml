@@ -1,0 +1,314 @@
+---
+# Upgrade the cluster components: Rancher, Longhorn, k3s, Linkerd.
+# UNIVERSAL — you NEVER provide version numbers. Everything is discovered:
+#   - Rancher/Longhorn: installed version from `helm list`, available versions
+#     from `helm search repo --versions` (officially documented discovery);
+#     the stepwise latest-patch-per-minor path is computed by
+#     ansible/files/stepwise-path.py (both vendors require one-minor hops;
+#     Longhorn's pre-upgrade job hard-blocks skipping).
+#   - k3s: the system-upgrade-controller plans track the stable CHANNEL URL and
+#     resolve + apply new versions themselves — no version string exists here.
+#   - Linkerd: install script always fetches the newest CLI; `linkerd upgrade`
+#     targets the CLI version and retains cluster config/TLS.
+# Optional overrides (leave empty for fully automatic):
+#   -e rancher_max_minor=2.14     stop the Rancher path at a minor
+#   -e k3s_version=v1.37.3+k3s1   pin the plans instead of following the channel
+#
+# Order per official docs:
+#   1. Rancher FIRST — SUSE upgrade checklist: "Rancher, Kubernetes, then OS".
+#   2. Longhorn next (before any k3s version bump); engines live-upgraded per step.
+#   3. k3s via the plans (server -> agent, cordon, concurrency 1); the playbook
+#      just waits for convergence.
+#   4. Linkerd last (orthogonal). Channel follows the cluster (edge->edge,
+#      stable->stable); viz is re-installed with the customized
+#      `-enforced-host` regex re-applied by sed (extensions have no `upgrade`).
+#
+#   ansible-playbook -i ansible/inventory.ini ansible/update-cluster.yml
+#   dry run (version report only, no changes):  --tags report
+#   single component:                           --tags rancher|longhorn|k3s|linkerd
+#
+# All steps run ON THE MASTER (helm/kubectl/linkerd CLI live there). Nothing is
+# destroyed; worst case per component is a helm rollback to the previous
+# release (revision recorded in the output). Pre-step: Keycloak backup.
+# Before a real run also take a k3s snapshot: sudo k3s etcd-snapshot save.
+
+- name: Pre-flight — backup + current versions
+  hosts: kube_master
+  gather_facts: false
+  tags: [report, always]
+  vars:
+    repo_dir: /home/worker/k8s-template
+  tasks:
+    - name: Keycloak backup (realm JSON + DB dumps)
+      ansible.builtin.command: bash {{ repo_dir }}/scripts/backup-keycloak.sh
+      when: skip_backup | default(false) | bool == false
+      register: kc_backup
+      changed_when: true
+      failed_when: false
+      tags: [backup]
+
+    - name: Collect current versions
+      ansible.builtin.shell: |
+        echo "rancher=$(kubectl -n cattle-system get deploy rancher -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)"
+        echo "longhorn=$(kubectl -n longhorn-system get deploy longhorn-driver-deployer -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)"
+        echo "linkerd=$(kubectl -n linkerd get deploy linkerd-destination -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)"
+        echo "k3s=$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}' 2>/dev/null)"
+        echo "k3s_plan_target=$(kubectl -n system-upgrade get plan server-plan -o jsonpath='{.status.latestVersion}' 2>/dev/null)"
+      register: ver_before
+      changed_when: false
+      check_mode: false
+
+    - name: Report current versions
+      ansible.builtin.debug:
+        msg: "{{ ver_before.stdout_lines }}"
+
+- name: Upgrade Rancher (auto-discovered stepwise path, latest patch per minor)
+  hosts: kube_master
+  gather_facts: false
+  tags: [rancher]
+  vars:
+    rancher_repo: rancher-stable/rancher
+    rancher_max_minor: ""   # optional: stop the path at this minor, e.g. "2.14"
+  tasks:
+    - name: Ensure helm repos are present
+      ansible.builtin.command: "helm repo add {{ item.0 }} {{ item.1 }}"
+      loop: [["rancher-stable", "https://releases.rancher.com/server-charts/stable"], ["longhorn", "https://charts.longhorn.io"]]
+      loop_control: { label: "{{ item.0 }}" }
+      changed_when: false
+
+    - name: Update helm repos
+      ansible.builtin.command: helm repo update
+      changed_when: true
+
+    - name: Ship stepwise path helper
+      ansible.builtin.copy:
+        src: files/stepwise-path.py
+        dest: /tmp/stepwise-path.py
+        mode: "0755"
+
+    - name: Detect installed Rancher chart version
+      ansible.builtin.shell: >-
+        helm list -n cattle-system --filter '^rancher$' -o json |
+        python3 -c "import sys,json;print(json.load(sys.stdin)[0]['app_version'].lstrip('v'))"
+      register: rancher_installed
+      changed_when: false
+      check_mode: false
+
+    - name: Compute Rancher upgrade path
+      ansible.builtin.shell: |
+        set -e
+        helm search repo {{ rancher_repo }} --versions -o json > /tmp/rancher-repo.json
+        CUR="{{ rancher_installed.stdout }}" MAX="{{ rancher_max_minor }}" python3 /tmp/stepwise-path.py /tmp/rancher-repo.json
+      register: rancher_path
+      changed_when: false
+      check_mode: false
+
+    - name: Report Rancher path
+      ansible.builtin.debug:
+        msg: "installed={{ rancher_installed.stdout }} steps={{ rancher_path.stdout_lines }}"
+
+    - name: Step through versions
+      ansible.builtin.include_tasks: tasks/upgrade-rancher-step.yml
+      loop: "{{ rancher_path.stdout_lines }}"
+      loop_control: { loop_var: step, label: "{{ step }}" }
+
+- name: Upgrade Longhorn (auto-discovered stepwise path + engine live-upgrade)
+  hosts: kube_master
+  gather_facts: false
+  tags: [longhorn]
+  vars:
+    longhorn_live_upgrade: true   # patch volume engines after each step (false = do it via UI)
+  tasks:
+    - name: Ensure longhorn helm repo is present
+      ansible.builtin.command: helm repo add longhorn https://charts.longhorn.io
+      changed_when: false
+
+    - name: Update helm repos
+      ansible.builtin.command: helm repo update
+      changed_when: true
+
+    - name: Ship stepwise path helper
+      ansible.builtin.copy:
+        src: files/stepwise-path.py
+        dest: /tmp/stepwise-path.py
+        mode: "0755"
+
+    - name: Preflight — no faulted/unhealthy Longhorn volumes
+      ansible.builtin.shell: |
+        kubectl -n longhorn-system get volumes -o jsonpath='{range .items[*]}{.status.robustness}{"\n"}{end}' | grep -vc healthy || true
+      register: lh_bad
+      failed_when: (lh_bad.stdout | int) > 0
+      changed_when: false
+
+    - name: Detect installed Longhorn version
+      ansible.builtin.shell: >-
+        helm list -n longhorn-system --filter '^longhorn$' -o json |
+        python3 -c "import sys,json;print(json.load(sys.stdin)[0]['app_version'].lstrip('v'))"
+      register: lh_installed
+      changed_when: false
+      check_mode: false
+
+    - name: Compute Longhorn upgrade path
+      ansible.builtin.shell: |
+        set -e
+        helm search repo longhorn --versions -o json > /tmp/longhorn-repo.json
+        CUR="{{ lh_installed.stdout }}" python3 /tmp/stepwise-path.py /tmp/longhorn-repo.json
+      register: lh_path
+      changed_when: false
+      check_mode: false
+
+    - name: Report Longhorn path
+      ansible.builtin.debug:
+        msg: "installed={{ lh_installed.stdout }} steps={{ lh_path.stdout_lines }}"
+
+    - name: Step through versions
+      ansible.builtin.include_tasks: tasks/upgrade-longhorn-step.yml
+      loop: "{{ lh_path.stdout_lines }}"
+      loop_control: { loop_var: step, label: "{{ step }}" }
+
+- name: "Upgrade k3s (system-upgrade-controller plans: server then agents)"
+  hosts: kube_master
+  gather_facts: false
+  tags: [k3s]
+  vars:
+    k3s_version: ""   # optional pin, e.g. "v1.37.3+k3s1"; empty = follow the stable channel
+  tasks:
+    - name: Ensure upgrade plans exist
+      ansible.builtin.command: kubectl -n system-upgrade get plan {{ item }}
+      loop: [server-plan, agent-plan]
+      changed_when: false
+      failed_when: false
+      register: k3s_plans
+      check_mode: false
+
+    - name: Fail if plans are missing
+      ansible.builtin.assert:
+        that: k3s_plans.results | selectattr('rc', 'ne', 0) | list | length == 0
+        fail_msg: "system-upgrade plans missing on master — apply dev-infra k3s/upgrade.yaml first"
+
+    - name: Pin plans to k3s_version (server first)
+      ansible.builtin.shell: |
+        kubectl -n system-upgrade patch plan {{ item }} --type merge -p '{"spec":{"version":"{{ k3s_version }}","channel":""}}'
+      loop: [server-plan, agent-plan]
+      when: k3s_version | length > 0
+      register: k3s_pin
+      changed_when: "'patched' in k3s_pin.stdout | default('')"
+
+    - name: Report plan targets
+      ansible.builtin.shell: |
+        kubectl -n system-upgrade get plans -o jsonpath='{range .items[*]}{.metadata.name} target={.status.latestVersion}{"\n"}{end}'
+      register: k3s_targets
+      changed_when: false
+      check_mode: false
+
+    - name: Wait until all nodes run one identical k3s version
+      ansible.builtin.shell: |
+        kubectl get nodes -o jsonpath='{range .items[*]}{.status.nodeInfo.kubeletVersion}{"\n"}{end}' | sort -u | tr '\n' ' '
+      register: k3s_versions
+      until: >-
+        (k3s_versions.stdout.split() | unique | length) == 1 and
+        (k3s_version | default('', true) | length == 0 or k3s_versions.stdout.split()[0] == k3s_version)
+      retries: 60
+      delay: 15
+      changed_when: false
+      check_mode: false
+
+    - name: Wait for all nodes Ready
+      ansible.builtin.shell: kubectl get nodes --no-headers | grep -c ' Ready'
+      register: nodes_ready
+      until: (nodes_ready.stdout | int) >= (groups.kube_nodes | length)
+      retries: 20
+      delay: 10
+      changed_when: false
+      check_mode: false
+
+- name: "Upgrade Linkerd (channel-aware: edge->edge, stable->stable)"
+  hosts: kube_master
+  gather_facts: false
+  tags: [linkerd]
+  vars:
+    linkerd_restart_meshed: true   # rollout restart injected deployments (brief pod churn)
+  tasks:
+    - name: Detect installed channel from the running control plane
+      ansible.builtin.set_fact:
+        linkerd_channel: "{{ 'edge' if 'edge-' in (ver_before.stdout | regex_search('linkerd/proxy:[^\\s]+') or '') else 'stable' }}"
+
+    - name: Install/refresh matching CLI on master
+      ansible.builtin.shell: |
+        set -e
+        URL=https://run.linkerd.io/install{{ '-edge' if linkerd_channel == 'edge' else '' }}
+        curl -sSfL $URL | sh >/dev/null
+        export PATH=$HOME/.local/bin:$PATH
+        linkerd version --client
+      register: linkerd_cli
+      changed_when: true
+
+    - name: Set linkerd binary path
+      ansible.builtin.set_fact:
+        lkd: "$HOME/.local/bin/linkerd"
+
+    - name: Pre-upgrade check
+      ansible.builtin.command: "{{ lkd }} check"
+      environment: { PATH: "/usr/local/bin:/usr/bin:/bin:{{ ansible_env.HOME | default('/home/worker') }}/.local/bin" }
+      changed_when: false
+
+    - name: Upgrade CRDs + control plane (retains cluster config/TLS)
+      ansible.builtin.shell: "{{ lkd }} upgrade --crds | kubectl apply -f - && {{ lkd }} upgrade | kubectl apply -f -"
+      environment: { PATH: "/usr/local/bin:/usr/bin:/bin:{{ ansible_env.HOME | default('/home/worker') }}/.local/bin" }
+      changed_when: true
+
+    - name: Wait for linkerd control plane
+      ansible.builtin.command: "kubectl -n linkerd rollout status deploy/{{ item }} --timeout=180s"
+      loop: [linkerd-destination, linkerd-identity, linkerd-proxy-injector]
+      changed_when: false
+
+    - name: Re-install viz keeping the customized -enforced-host
+      ansible.builtin.shell: |
+        {{ lkd }} viz install | sed 's/- -enforced-host=.*$/- -enforced-host=.*$/' | kubectl apply -f -
+      environment: { PATH: "/usr/local/bin:/usr/bin:/bin:{{ ansible_env.HOME | default('/home/worker') }}/.local/bin" }
+      changed_when: true
+
+    - name: Prune leftovers
+      ansible.builtin.shell: "{{ lkd }} prune | kubectl delete --ignore-not-found -f - || true"
+      environment: { PATH: "/usr/local/bin:/usr/bin:/bin:{{ ansible_env.HOME | default('/home/worker') }}/.local/bin" }
+      changed_when: true
+
+    - name: Restart meshed deployments (data plane proxies)
+      ansible.builtin.shell: |
+        for d in $(kubectl -n default get deploy -o name); do
+          kubectl -n default rollout restart $d >/dev/null && kubectl -n default rollout status $d --timeout=180s >/dev/null && echo "ok $d"
+        done
+      when: linkerd_restart_meshed | bool
+      changed_when: true
+
+    - name: Post-upgrade check
+      ansible.builtin.command: "{{ lkd }} check --proxy"
+      environment: { PATH: "/usr/local/bin:/usr/bin:/bin:{{ ansible_env.HOME | default('/home/worker') }}/.local/bin" }
+      changed_when: false
+
+- name: Post-flight — versions and health
+  hosts: kube_master
+  gather_facts: false
+  tags: [report, always]
+  tasks:
+    - name: Collect versions after
+      ansible.builtin.shell: |
+        echo "rancher=$(kubectl -n cattle-system get deploy rancher -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)"
+        echo "longhorn=$(kubectl -n longhorn-system get deploy longhorn-driver-deployer -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)"
+        echo "linkerd=$(kubectl -n linkerd get deploy linkerd-destination -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)"
+        echo "k3s=$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}' 2>/dev/null)"
+      register: ver_after
+      changed_when: false
+      check_mode: false
+
+    - name: App health after upgrades
+      ansible.builtin.shell: |
+        T=$(curl -s -m 8 -d "client_id=frontend" -d "username=user" -d "password=user" -d "grant_type=password" https://auth.softeno.dev/realms/app/protocol/openid-connect/token | python3 -c "import sys,json;print(json.load(sys.stdin).get('access_token',''))")
+        echo "external: $(curl -s -m 8 -H "Authorization: Bearer $T" https://api.softeno.dev/spring-reactive-template/external/1) $(curl -s -m 8 -H "Authorization: Bearer $T" https://api.softeno.dev/spring-reactive-r2dbc-template/external/1)"
+      register: app_health
+      changed_when: false
+      check_mode: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ ver_after.stdout_lines + [app_health.stdout] }}"

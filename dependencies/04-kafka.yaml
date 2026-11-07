@@ -247,6 +247,20 @@ spec:
       labels:
         app: kafka-ui
     spec:
+      # musl (Alpine) resolver in this image aborts DNS when a search-domain query
+      # fails; the kubelet-inherited `lan` search suffix hits the unreachable LAN
+      # forwarder -> "No resolvable bootstrap urls". Pin in-cluster DNS only.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 10.43.0.10
+        searches:
+          - kafka.svc.cluster.local
+          - svc.cluster.local
+          - cluster.local
+        options:
+          - name: ndots
+            value: "5"
       containers:
         - name: kafka-ui
           image: provectuslabs/kafka-ui:latest

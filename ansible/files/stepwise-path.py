@@ -37,7 +37,7 @@ if target_minor < cur_minor:
 path = []
 for minor in sorted({key(v)[:2] for v in charts if cur_minor <= key(v)[:2] <= target_minor}):
     latest = [v for v in charts if key(v)[:2] == minor][-1]
-    if key(latest) > cur or minor == cur_minor:
-        path.append(latest)
+    if key(latest) > cur or (minor == cur_minor and key(latest) == cur):
+        path.append(latest)  # never emit a downgrade within the current minor
 
 print("\n".join(path))

@@ -13,6 +13,7 @@
     helm upgrade rancher {{ rancher_repo }} --namespace cattle-system
     --version {{ step }}
     --set ingress.enabled=false --set bootstrapPassword=admin --set ingress.tls.source=none
+  when: step != rancher_installed.stdout   # already at this version — no no-op revision
   register: rancher_step
   failed_when: false
 
@@ -31,13 +32,18 @@
 
 - name: Warn about forced upgrade
   ansible.builtin.debug:
-    msg: "FORCED Rancher {{ step }} past its kubeVersion gate (chart patched locally) — OUTSIDE SUSE support matrix with k3s {{ k3s_running | default('1.37') }}. Watch rancher pod logs; rollback = helm rollback rancher -n cattle-system."
+    msg: "FORCED Rancher {{ step }} past its kubeVersion gate (chart patched locally) — OUTSIDE SUSE support matrix with {{ ver_before.stdout_lines | select('match', 'k3s=') | first | default('k3s=?') }}. Watch rancher pod logs; rollback = helm rollback rancher -n cattle-system."
   when: rancher_forced.rc is defined and rancher_forced.rc == 0
 
 - name: Fail if forced upgrade also failed
   ansible.builtin.fail:
     msg: "Rancher {{ step }} failed even with patched chart: {{ rancher_forced.stderr | default(rancher_step.stderr) }}"
   when: rancher_forced.rc is defined and rancher_forced.rc != 0
+
+- name: Fail on any other upgrade error (do not continue the path on a broken release)
+  ansible.builtin.fail:
+    msg: "Rancher {{ step }} upgrade failed: {{ rancher_step.stderr | default('') }}"
+  when: rancher_step.rc | default(0) != 0 and 'kubeVersion' not in rancher_step.stderr | default('') and rancher_forced.rc is not defined
 
 - name: Wait for rancher deployment rollout
   ansible.builtin.command: kubectl -n cattle-system rollout status deploy/rancher --timeout=300s

@@ -274,6 +274,7 @@
         kubectl -n linkerd get cm linkerd-identity-trust-roots -o json | python3 -c "
         import sys, json
         open('/tmp/id-ca.pem','w').write(json.load(sys.stdin)['data']['ca-bundle.crt'])"
+        chmod 600 /tmp/id-crt.pem /tmp/id-key.pem /tmp/id-ca.pem
       changed_when: false
 
     - name: Upgrade CRDs + control plane (retains cluster config/TLS, uses live certs)
@@ -289,6 +290,10 @@
     - name: Wait for linkerd control plane
       ansible.builtin.command: "kubectl -n linkerd rollout status deploy/{{ item }} --timeout=180s"
       loop: [linkerd-destination, linkerd-identity, linkerd-proxy-injector]
+      changed_when: false
+
+    - name: Remove exported identity material from /tmp
+      ansible.builtin.shell: shred -u /tmp/id-crt.pem /tmp/id-key.pem /tmp/id-ca.pem 2>/dev/null || rm -f /tmp/id-crt.pem /tmp/id-key.pem /tmp/id-ca.pem
       changed_when: false
 
     - name: Re-install viz keeping the customized -enforced-host
@@ -334,14 +339,14 @@
   tags: [deps]
   vars:
     helm_deps:
-      - {release: cert-manager, repo_url: https://charts.jetstack.io, chart: cert-manager/cert-manager, ns: cert-manager, deploy: cert-manager}
-      - {release: ingress-nginx, repo_url: https://kubernetes.github.io/ingress-nginx, chart: ingress-nginx/ingress-nginx, ns: ingress-nginx, deploy: ingress-nginx-controller}
-      - {release: cnpg, repo_url: https://cloudnative-pg.github.io/charts, chart: cnpg/cloudnative-pg, ns: postgres, deploy: cnpg-controller-manager}
-      - {release: mongodb-community-operator, repo_url: https://mongodb.github.io/helm-charts, chart: mongodb/community-operator, ns: mongo, deploy: mongodb-kubernetes-operator}
-      - {release: strimzi-operator, repo_url: https://strimzi.io/charts/, chart: strimzi/strimzi-kafka-operator, ns: kafka, deploy: strimzi-cluster-operator}
+      - {release: cert-manager, repo: cert-manager, url: https://charts.jetstack.io, chart: cert-manager/cert-manager, ns: cert-manager, deploy: cert-manager}
+      - {release: ingress-nginx, repo: ingress-nginx, url: https://kubernetes.github.io/ingress-nginx, chart: ingress-nginx/ingress-nginx, ns: ingress-nginx, deploy: ingress-nginx-controller}
+      - {release: cnpg, repo: cnpg, url: https://cloudnative-pg.github.io/charts, chart: cnpg/cloudnative-pg, ns: postgres, deploy: cnpg-controller-manager}
+      - {release: mongodb-community-operator, repo: mongodb, url: https://mongodb.github.io/helm-charts, chart: mongodb/community-operator, ns: mongo, deploy: mongodb-kubernetes-operator}
+      - {release: strimzi-operator, repo: strimzi, url: https://strimzi.io/charts/, chart: strimzi/strimzi-kafka-operator, ns: kafka, deploy: strimzi-cluster-operator}
   tasks:
     - name: Ensure dependency helm repos are present
-      ansible.builtin.command: "helm repo add {{ item.release }} {{ item.repo_url }}"
+      ansible.builtin.command: "helm repo add {{ item.repo }} {{ item.url }}"
       loop: "{{ helm_deps }}"
       loop_control: { label: "{{ item.release }}" }
       changed_when: false

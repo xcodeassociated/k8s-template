@@ -8,7 +8,7 @@ A **template Kubernetes manifest stack** (plain YAML, no application source, no 
 
 - `spring-reactive-mongo` — [spring-reactive-template](https://github.com/xcodeassociated/spring-reactive-template) (Spring reactive + MongoDB + Kafka)
 - `spring-reactive-r2dbc` — [spring-reactive-r2dbc-template](https://github.com/xcodeassociated/spring-reactive-r2dbc-template) (Spring reactive + R2DBC/PostgreSQL + Kafka)
-- `react-typescript-template` — [react-typescript-vite-template](https://github.com/xcodeassociated/react-typescript-vite-template) frontend
+- `react-typescript-template` — [react-typescript-vite-plus-template](https://github.com/xcodeassociated/react-typescript-vite-plus-template) frontend
 
 Shared dependencies: PostgreSQL (CloudNativePG), MongoDB (Community Operator), Kafka (Strimzi), Grafana otel-lgtm, Keycloak. Treat this repo as a template: copy it, rename resources/domains/images, and replace the secret workflow before real use. It is intended to be public-repo safe — never commit real credentials, kubeconfigs, keys, or generated secret files.
 

@@ -19,7 +19,7 @@ the secret workflow before using it for a real application.
 
 - [spring-reactive-template](https://github.com/xcodeassociated/spring-reactive-template) — Spring reactive + MongoDB + Kafka (WebSocket, gRPC)
 - [spring-reactive-r2dbc-template](https://github.com/xcodeassociated/spring-reactive-r2dbc-template) — Spring reactive + R2DBC/PostgreSQL + Kafka (Liquibase, GraphQL, gRPC)
-- [react-typescript-vite-template](https://github.com/xcodeassociated/react-typescript-vite-template) — React + TypeScript + Vite frontend
+- [react-typescript-vite-plus-template](https://github.com/xcodeassociated/react-typescript-vite-plus-template) — React + TypeScript + Vite+ frontend
 
 ## Features
 

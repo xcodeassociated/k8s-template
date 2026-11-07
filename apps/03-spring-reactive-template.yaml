@@ -21,6 +21,17 @@ data:
   KAFKA_TOPIC_TX: "sample_topic_2"
   KAFKA_TOPIC_RX: "sample_topic_2"
   KAFKA_KEYCLOAK: "keycloak-events"
+  # required: com.softeno.kafka.keycloak-admin=${KAFKA_KEYCLOAK_ADMIN}
+  KAFKA_KEYCLOAK_ADMIN: "keycloak-admin-events"
+
+  # ── WebSocket (/ws + one-time-ticket handshake) ────────────────────────────
+  # Explicit enablement; allowed-origins must list the exact origins the
+  # frontend/dev-chat pages are served from, or the handshake and ticket
+  # redemption are rejected (CSWSH protection). The BE Ingress already carries
+  # the Upgrade/timeouts/buffering/sticky-session annotations.
+  COM_SOFTENO_WS_ENABLED: "true"
+  COM_SOFTENO_WS_ALLOWED_ORIGINS: "https://app.softeno.dev,https://api.softeno.dev"
+  COM_SOFTENO_TICKET_ALLOWED_ORIGINS: "https://app.softeno.dev,https://api.softeno.dev"
 
   # ── Keycloak / OAuth2 ──────────────────────────────────────────────────────
   OAUTH_CLIENT_ID: "backend"
@@ -34,7 +45,9 @@ data:
   # ── Inter-service calls (both apps run in the same namespace: default) ─────
   EXTERNAL_URL: "http://spring-reactive-r2dbc:8082/sample-secured"
   EXTERNAL_NAME: "spring-reactive-r2dbc-template"
-  EXTERNAL_GRAPH_QL: "http://spring-reactive-r2dbc:8082/graphql"
+  # r2dbc serves no GraphQL endpoint — the sample external-GraphQL client
+  # targets this app's own /graphql (same as the compose localhost pattern)
+  EXTERNAL_GRAPH_QL: "http://spring-reactive-mongo:8080/graphql"
   SPRING_GRPC_CLIENT_CHANNELS_EXTERNAL_ADDRESS: "spring-reactive-r2dbc:9082"
 
   # ── Observability (Grafana otel-lgtm in grafana namespace) ─────────────────

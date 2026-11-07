@@ -9,13 +9,21 @@
     --set ingress.enabled=false --set bootstrapPassword=admin --set ingress.tls.source=none
   when: step != rancher_installed.stdout
   register: rancher_step
+  failed_when:
+    - rancher_step.rc != 0
+    - "'kubeVersion' not in rancher_step.stderr"
+
+- name: Warn if Rancher blocked by kubeVersion gate (k3s above Rancher's support matrix)
+  ansible.builtin.debug:
+    msg: "SKIPPED Rancher {{ step }}: {{ rancher_step.stderr | default('') }} — Rancher stays on {{ rancher_installed.stdout }} until a release certifies this k3s version"
+  when: rancher_step.rc is defined and rancher_step.rc != 0 and 'kubeVersion' in rancher_step.stderr | default('')
 
 - name: Wait for rancher deployment rollout
   ansible.builtin.command: kubectl -n cattle-system rollout status deploy/rancher --timeout=300s
-  when: rancher_step is not skipped
+  when: rancher_step is not skipped and rancher_step.rc == 0
   changed_when: false
 
 - name: Wait for rancher pods Ready
   ansible.builtin.command: kubectl -n cattle-system wait --for=condition=Ready pod -l app=rancher --timeout=300s
-  when: rancher_step is not skipped
+  when: rancher_step is not skipped and rancher_step.rc == 0
   changed_when: false

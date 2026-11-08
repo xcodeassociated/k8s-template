@@ -149,6 +149,8 @@ It runs in the only safe order: Keycloak backup (while all pods still run — CN
 
 **Verified end-to-end 2026-11-07** (real run): full shutdown completed in ~5 min; guests take 1–3 min per node after SSH drops (k3s/Longhorn stop-timeout), so the Proxmox verify play is the true completion signal. Gotchas found + fixed during that run: `wait_for` must be `delegate_to: localhost` + `become: false` (SSH to a dying guest is refused, and controller sudo doesn't exist); this PVE build has no `type` field under `/nodes/<n>/qemu`.
 
+**VM-off cluster backup (verified 2026-11-08)**: run `shutdown-cluster.yml` first (it takes the Keycloak backup while pods still run and leaves all 4 VMs `stopped`), then `vzdump 500 501 502 503 --storage local-nvme2 --mode stop --compress zstd` on the PVE host (~7 min, ~80 GB total archives to `/mnt/pve/local-nvme2/dump/`). The backup API (`POST /nodes/p0b/qemu/<v>/backup`) and `reset` 501 on this PVE build (like `/resources`) — vzdump must run over SSH on the host; from the dev machine that means `sshpass -p <pve_password from group_vars/all/pve.yml> ssh root@p0b.lan` **spawned from zsh** (the macOS firewall blocks python-spawned network binaries — the ansible gotcha again). No backup *jobs* are configured; this is manual. Restore: `qmrestore <storage>:backup/vzdump-qemu-<v>-<ts>.vma.zst <vmid>` (or the GUI), then `startup-cluster.yml`.
+
 **The shutdown/startup playbooks are non-destructive** — they only stop/start VMs and wait; nothing in the cluster is created, deleted, or reset. `update-os.yml` installs package upgrades on the guests (rolling, master last) but changes no cluster resources.
 
 ### Cluster startup (Ansible, run from the dev machine)

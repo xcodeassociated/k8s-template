@@ -25,6 +25,9 @@ data:
   SPRING_SECURITY_OAUTH2_CLIENT_PROVIDER_KEYCLOAK_JWK_SET_URI: "https://auth.softeno.dev/realms/app/protocol/openid-connect/certs"
 
   # ── Kafka (Strimzi kafka-cluster) ─────────────────────────────────────────
+  # Fan-out note (ADR-0008): listeners join per-instance consumer groups
+  # (instance-id defaults to HOSTNAME = pod name) so EVERY replica consumes
+  # EVERY event on the broadcast topics — see AGENTS.md "Kafka fan-out groups".
   SPRING_KAFKA_BOOTSTRAP_SERVERS: "kafka-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092"
   SPRING_KAFKA_CONSUMER_GROUP_ID: "other-group-jvm"
   COM_SOFTENO_KAFKA_TX: "sample_topic_2"

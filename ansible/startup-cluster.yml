@@ -198,13 +198,31 @@
           delay: 10
           changed_when: false
 
-        - name: Wait for Kafka + Mongo + grafana pods Running
-          ansible.builtin.shell: kubectl get pods -A --no-headers | grep -E "^(kafka|mongo|grafana) " | grep -vcE "Running|Completed" || true
+        - name: Wait for Kafka + Mongo + grafana pods Running and Ready
+          # Match on the READY column (not the word "Running") so a
+          # 1/2-Ready pod never counts as good.
+          ansible.builtin.shell: |
+            kubectl get pods -A --no-headers | awk \
+              '($1=="kafka"||$1=="mongo"||$1=="grafana"){split($3,r,"/"); if(r[1]!=r[2] && $4!="Completed") c++} END{print c+0}'
           register: deps_bad
           until: (deps_bad.stdout | int) == 0
           retries: 18
           delay: 10
           changed_when: false
+
+        - name: Nudge Strimzi entity-operator if it raced the brokers
+          # Crash-looping after a cold boot because it started before the
+          # brokers; the pod is stateless, so one delete restarts it.
+          ansible.builtin.shell: |
+            kubectl -n kafka get pods -l strimzi.io/name=kafka-cluster-entity-operator --no-headers \
+              | awk '{split($2,r,"/"); if(r[1]==r[2]) ok++} END{print ok+0}'
+          register: eo_ok
+          changed_when: false
+
+        - name: Restart crash-looping entity-operator
+          ansible.builtin.command: kubectl -n kafka delete pods -l strimzi.io/name=kafka-cluster-entity-operator --wait=false
+          when: (eo_ok.stdout | int) == 0
+          changed_when: true
 
         - name: Wait for app deployments Ready
           ansible.builtin.shell: kubectl -n default get deploy --no-headers | grep -vE "1/1" | wc -l

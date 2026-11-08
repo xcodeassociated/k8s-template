@@ -1,0 +1,26 @@
+---
+# Included per app deployment from deploy-cluster.yml (loop var: item.name /
+# item.timeout). Restarts one deployment (re-pulling :latest) and awaits it;
+# on timeout prints pod/event/log diagnostics then fails the play so the
+# image-prune play never runs against a broken deploy.
+
+- name: "Restart (re-pull :latest) {{ item.name }}"
+  ansible.builtin.command: kubectl -n default rollout restart deploy/{{ item.name }}
+
+- name: "Wait for {{ item.name }} to roll out"
+  block:
+    - name: "Rollout status {{ item.name }}"
+      ansible.builtin.command: >-
+        kubectl -n default rollout status deploy/{{ item.name }} --timeout={{ item.timeout }}s
+  rescue:
+    - name: "Diagnostics for {{ item.name }}"
+      ansible.builtin.shell: |
+        echo "-- pods:"; kubectl -n default get pods -l app={{ item.name }} -o wide --no-headers 2>&1
+        echo "-- events:"; kubectl -n default get events --sort-by=.lastTimestamp 2>/dev/null | tail -8
+        echo "-- app log tail:"; kubectl -n default logs deploy/{{ item.name }} -c {{ item.name }} --tail=15 2>&1 | tail -15
+      register: diag
+      changed_when: false
+
+    - name: "Fail with rollout diagnostics for {{ item.name }}"
+      ansible.builtin.fail:
+        msg: "rollout of {{ item.name }} did not converge — {{ diag.stdout_lines }}"

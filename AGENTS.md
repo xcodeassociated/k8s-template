@@ -57,7 +57,9 @@ End-user login credentials for the deployed app live in the repo-root **`.creden
 
 **Longhorn live-upgrade + reboot deadlock (seen 2026-11-08)**: if the cluster is shut down while a Longhorn engine live-upgrade hasn't fully landed, ALL volumes come back `detached faulted` and the volume controller loops "no healthy or scheduled replica for starting" (logs also show "Removing inactive replica … detached accidentally during the live upgrade"; upstream longhorn/longhorn#13629, workaround-available). Recovery that worked: (1) set each volume's `spec.image` to the SURVIVING replicas' image (`kubectl get replicas.longhorn.io -n longhorn-system -o json` → `spec.image`; usually the new default) — NOT the stale `status.currentImage`; (2) for volumes still detached, patch `spec.active=true` on the one replica with `failedAt=""` to give the engine a startable replica; (3) verify each volume's payload (host `mount | grep <pvc-uid>` → globalmount; `ls`) — live-upgrade leftovers can wake as EMPTY filesystems. After recovery: CNPG replica PVCs that came back empty just need `kubectl delete pvc+pod` (operator rejoins via pg_basebackup from the primary — verify the primary's volume has `pgdata/` first); MongoDB may elect the stale member (local RS config regressed → lower electionId → Java driver refuses any primary with "MongoStalePrimaryException") — fix with `rs.stepDown(600)` on the stale primary (an up-to-date member wins) and restart the app pods to reset the driver topology cache.
 
-**Ansible wait_for + macOS firewall**: `wait_for` (and any Python-socket task) delegated to localhost can hang/time out even when the port is open — the macOS firewall blocks the Homebrew Python interpreter (same root cause as the curl-based Proxmox calls). The startup playbook's SSH wait now probes with the system `ssh` binary instead; keep that pattern for any localhost-delegated port checks.
+**Ansible wait_for + macOS firewall**: `wait_for` (and any Python-socket task) delegated to localhost can hang/time out even when the port is open — the macOS firewall blocks the Homebrew Python interpreter (same root cause as the curl-based Proxmox calls). The startup playbook's SSH wait now probes with the system `ssh` binary instead; keep that pattern for any localhost-delegated port checks. **Deploy playbook finding (2026-11-08)**: the firewall also blocks binaries *spawned from the ansible python* — `synchronize`/rsync (its ssh child fails with `connect … Undefined error: 0`), and even `shell:` ssh/tar pipelines (`/bin/sh -c ssh` is blocked while the same `ssh` from an interactive zsh works). What DOES work: modules that use ansible's own connection plugin (`copy`, `command`, `shell` running ON the target) — that is why `deploy-cluster.yml` transfers manifests with `ansible.builtin.copy`, never rsync.
+
+**Rollout surge memory incident (2026-11-08)**: a plain `rollout restart` of both 2-replica JVM apps at once ran old+new pods together, swap-thrashed a 4 GB node until its kubelet died (node `NotReady`, Linkerd control plane + a Kafka broker on it → mesh-wide TLS outages). Guard in place: `maxSurge: 0 / maxUnavailable: 1` in the two JVM Deployments (`ansible/deploy-cluster.yml` also rolls one deployment at a time). Do not remove the strategy or restart multiple app deployments in parallel.
 
 **Longhorn replica scheduling vs node disk usage**: `storage-reserved-percentage-for-default-disk=30` + the default disk living on the shared root FS (also used by containerd) means a node above ~70% real disk usage goes unschedulable ("Actual space usage condition failed") — new/rebuilding volumes then quietly sit at 2/3 replicas (`degraded`, `Scheduled=False`) while still serving. Fix: `sudo k3s crictl rmi --prune` on that node (freed 5G on kube-1 on 2026-11-08; worth running on all nodes after long uptimes), then `kubectl rollout restart ds/longhorn-manager -n longhorn-system` to trigger replenishment immediately instead of waiting for the replenishment interval.
 
@@ -106,6 +108,30 @@ Offline syntax check without a cluster (safe, verified):
 ```bash
 kubectl create --dry-run=client --validate=false -o name -f <file.yaml>
 ```
+
+Note: this reports `BAD` for files containing `TraefikService`/`HTTPRoute`
+objects when the LOCAL kubectl context has no such CRDs (e.g. the scratch
+kind cluster) — the plain Deployment/Service/ConfigMap resources in the
+same file are still parsed and listed first; only the CRD kinds are a
+false negative.
+
+### Application deploy (Ansible, run from the dev machine)
+
+```bash
+ansible-playbook -i ansible/inventory.ini ansible/deploy-cluster.yml
+# --tags deps | --tags apps | --skip-tags clean | -e deploy_keycloak=true
+```
+
+Deploys the CURRENT WORKING TREE (pushed to the master via ansible copy —
+no push/pull needed): apply dependencies (idempotent) → apply apps →
+rollout-restart `spring-reactive-mongo`, `spring-reactive-r2dbc`,
+`react-typescript-template` ONE AT A TIME (serial + `maxSurge: 0` keeps at
+most one extra JVM booting cluster-wide — the 2026-11-08 node-memory
+incident came from exactly that surge) → verify `/external` (with
+`scripts/fix-keycloak-service-clients.sh` self-heal) + public URLs →
+`k3s crictl rmi --prune` on every node to drop the superseded images. The
+prune play is LAST and never runs if anything before it failed. Verified
+end-to-end 2026-11-08 (freed ~9G/6G/1G on three nodes, apps 2/2 after).
 
 ### Graceful cluster shutdown (Ansible, run from the dev machine)
 

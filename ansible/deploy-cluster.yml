@@ -1,0 +1,247 @@
+---
+# Deploy the full stack from THIS working tree: dependencies, then every app
+# service (both backends + the frontend), verify it is healthy, and only then
+# remove the superseded container images from all nodes.
+#
+#   ansible-playbook -i ansible/inventory.ini ansible/deploy-cluster.yml
+#
+# Options:
+#   --tags deps            dependencies only (no app rollouts, no prune)
+#   --tags apps            skip dependency applies (apps + verify + prune)
+#   --skip-tags clean      keep the old images on the nodes
+#   -e deploy_keycloak=true   also rollout-restart Keycloak (auth drops for
+#                             ~1 min; existing tokens keep working until exp)
+#
+# How a deploy works here: app images are :latest + imagePullPolicy Always,
+# so deploying new images = apply manifests + rollout restart (forces a
+# re-pull). The JVM deployments roll with maxSurge 0 / maxUnavailable 1
+# (see AGENTS.md "rollout surge memory incident") and are restarted ONE
+# DEPLOYMENT AT A TIME, each awaited before the next starts — at most one
+# extra JVM is ever booting cluster-wide. The image prune is the LAST play
+# and only runs if every rollout is healthy and the endpoint checks passed;
+# any earlier failure stops the playbook BEFORE pruning.
+#
+# The manifests are pushed to /home/worker/k8s-deploy (a scratch dir) via
+# ansible copy, so the git checkout at ~/k8s-template stays clean and
+# `git pull` on the master keeps working.
+#
+# Every wait is bounded and fails fast with diagnostics; nothing runs in
+# the background. Typical runtime with no image changes: ~4 min.
+
+- name: Sync the working tree and check prerequisites
+  hosts: kube_master
+  gather_facts: false
+  tags: [always]
+  vars:
+    deploy_dir: /home/worker/k8s-deploy
+    repo_dir: /home/worker/k8s-template
+  tasks:
+    - name: Reset the scratch deploy dir on the master
+      # No rsync/synchronize and no delegated shell: the macOS firewall
+      # blocks network binaries spawned from the ansible python (AGENTS.md
+      # gotcha). ansible.builtin.copy uses the WORKING ansible ssh connection.
+      ansible.builtin.file:
+        path: "{{ deploy_dir }}"
+        state: absent
+
+    - name: Push apps/ and dependencies/ to the master
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../{{ item }}"
+        dest: "{{ deploy_dir }}/"
+        mode: preserve
+      loop: [apps, dependencies]
+
+    - name: Check the gitignored secret files came along
+      ansible.builtin.stat:
+        path: "{{ deploy_dir }}/{{ item }}"
+      loop: [apps/01-secrets.yaml, dependencies/01-secrets.yaml]
+      register: secret_files
+
+    - name: Fail when secret files are missing (they never live in git)
+      ansible.builtin.fail:
+        msg: >-
+          {{ item.item }} is missing — cp {{ item.item }}.template
+          {{ item.item }} in the repo and fill real values before deploying.
+      loop: "{{ secret_files.results }}"
+      when: not item.stat.exists
+
+    - name: Collect installed operator deployments
+      ansible.builtin.shell: |
+        kubectl get deploy -A --no-headers 2>/dev/null \
+          | awk '{print $1"/"$2}'
+      register: op_deploy
+      changed_when: false
+
+    - name: Fail when a required operator is missing
+      ansible.builtin.fail:
+        msg: >-
+          operators missing: {{ missing | join(', ') }} — install them first
+          (helm commands are in the README and the dependencies/ file headers)
+      vars:
+        want:
+          - postgres/cnpg-cloudnative-pg
+          - mongo/mongodb-kubernetes-operator
+          - kafka/strimzi-cluster-operator
+          - cert-manager/cert-manager
+          - traefik/traefik
+          - linkerd/linkerd-destination
+        missing: "{{ want | difference(op_deploy.stdout_lines) }}"
+      when: missing | length > 0
+
+- name: Apply the dependency stack
+  hosts: kube_master
+  gather_facts: false
+  tags: [deps]
+  vars:
+    deploy_dir: /home/worker/k8s-deploy
+  tasks:
+    - name: Apply dependencies in order
+      ansible.builtin.command: kubectl apply -f {{ deploy_dir }}/dependencies/{{ item }}
+      loop:
+        - 00-namespaces.yaml
+        - 01-secrets.yaml
+        - 02-postgres.yaml
+        - 03-mongo.yaml
+        - 04-kafka.yaml
+        - 05-grafana.yaml
+        - 06-gateway.yaml
+
+    - name: Wait for CNPG clusters healthy
+      ansible.builtin.command: kubectl -n postgres get clusters.postgresql.cnpg.io --no-headers
+      register: cnpg
+      until: (cnpg.stdout_lines | select('search', 'healthy') | list | length) >= 2
+      retries: 18
+      delay: 10
+      changed_when: false
+
+    - name: Wait for Kafka + Mongo + Grafana pods Ready
+      ansible.builtin.shell: |
+        kubectl get pods -A --no-headers | awk \
+          '($1=="kafka"||$1=="mongo"||$1=="grafana"){split($3,r,"/"); if(r[1]!=r[2] && $4!="Completed") c++} END{print c+0}'
+      register: deps_bad
+      until: (deps_bad.stdout | int) == 0
+      retries: 18
+      delay: 10
+      changed_when: false
+      failed_when: deps_bad.rc != 0 or (deps_bad.stdout | int) != 0
+
+- name: Deploy the app services (backends + frontend)
+  hosts: kube_master
+  gather_facts: false
+  tags: [apps]
+  vars:
+    deploy_dir: /home/worker/k8s-deploy
+    deploy_keycloak: false
+    app_deployments:
+      - name: spring-reactive-mongo
+        timeout: 300
+      - name: spring-reactive-r2dbc
+        timeout: 300
+      - name: react-typescript-template
+        timeout: 180
+  tasks:
+    - name: Apply app manifests (Keycloak manifest included, restart opt-in)
+      ansible.builtin.command: kubectl apply -f {{ deploy_dir }}/apps/{{ item }}
+      loop:
+        - 01-secrets.yaml
+        - 02-keycloak.yaml
+        - 03-spring-reactive-template.yaml
+        - 04-spring-reactive-r2dbc.yaml
+        - 05-react-typescript-template.yaml
+
+    - name: Restart Keycloak too (only when explicitly requested)
+      when: deploy_keycloak | bool
+      block:
+        - name: Rollout restart keycloak
+          ansible.builtin.command: kubectl -n default rollout restart deploy/keycloak
+        - name: Wait for keycloak
+          ansible.builtin.command: kubectl -n default rollout status deploy/keycloak --timeout=240s
+
+    # One deployment at a time, awaited before the next starts — this is the
+    # guard against the node-memory thrash from the 2026-11-08 incident.
+    - name: "Rollout {{ item.name }}"
+      ansible.builtin.include_tasks: tasks/deploy-rollout.yml
+      loop: "{{ app_deployments }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+- name: Verify every endpoint serves before touching images
+  hosts: kube_master
+  gather_facts: false
+  tags: [verify]
+  vars:
+    repo_dir: /home/worker/k8s-template
+  tasks:
+    - name: Check /external on both backends
+      ansible.builtin.shell: |
+        T=$(curl -s -m 8 -d "client_id=frontend" -d "username=user" -d "password=user" -d "grant_type=password" https://auth.softeno.dev/realms/app/protocol/openid-connect/token | python3 -c "import sys,json;print(json.load(sys.stdin).get('access_token',''))")
+        M=$(curl -s -m 8 -H "Authorization: Bearer $T" https://api.softeno.dev/spring-reactive-template/external/1)
+        R=$(curl -s -m 8 -H "Authorization: Bearer $T" https://api.softeno.dev/spring-reactive-r2dbc-template/external/1)
+        echo "$M $R"
+      register: ext
+      changed_when: false
+
+    - name: Self-heal service-account clients if FALLBACK
+      ansible.builtin.command: bash {{ repo_dir }}/scripts/fix-keycloak-service-clients.sh
+      when: "'FALLBACK' in ext.stdout"
+      register: heal
+      changed_when: true
+
+    - name: Re-check /external after heal
+      ansible.builtin.shell: |
+        T=$(curl -s -m 8 -d "client_id=frontend" -d "username=user" -d "password=user" -d "grant_type=password" https://auth.softeno.dev/realms/app/protocol/openid-connect/token | python3 -c "import sys,json;print(json.load(sys.stdin).get('access_token',''))")
+        echo "$(curl -s -m 8 -H "Authorization: Bearer $T" https://api.softeno.dev/spring-reactive-template/external/1) $(curl -s -m 8 -H "Authorization: Bearer $T" https://api.softeno.dev/spring-reactive-r2dbc-template/external/1)"
+      register: ext2
+      when: heal is not skipped
+      changed_when: false
+
+    - name: Fail while /external still answers FALLBACK
+      ansible.builtin.fail:
+        msg: "/external broken: {{ ext2.stdout | default(ext.stdout) }}"
+      when: "'FALLBACK' in (ext2.stdout | default(ext.stdout))"
+
+    - name: Check the public URLs
+      ansible.builtin.shell: |
+        for u in https://app.softeno.dev https://auth.softeno.dev/realms/app https://api.softeno.dev/spring-reactive-template/swagger-ui/index.html https://api.softeno.dev/spring-reactive-r2dbc-template/actuator/health; do
+          echo "$u $(curl -sk -o /dev/null -w '%{http_code}' -m 5 -L $u)"; done
+      register: urls
+      changed_when: false
+
+    - name: Fail when any URL is not serving
+      ansible.builtin.fail:
+        msg: "endpoint check failed: {{ urls.stdout_lines }}"
+      when: urls.stdout_lines | select('search', ' (000|404|500|502|503|504)$') | list | length > 0
+
+    - name: Deploy state
+      ansible.builtin.debug:
+        msg: >-
+          external={{ ext2.stdout | default(ext.stdout) }}
+          urls={{ urls.stdout_lines }}
+          healed={{ heal is not skipped }}
+
+- name: Remove superseded images (only reached when the deploy is healthy)
+  hosts: kube_nodes
+  gather_facts: false
+  tags: [clean]
+  tasks:
+    - name: Disk before prune
+      ansible.builtin.shell: df -h / | awk 'NR==2{print $4" free"}'
+      register: disk_before
+      changed_when: false
+
+    - name: Prune images not used by any pod on this node
+      # crictl rmi --prune removes dangling/unreferenced images only; images
+      # of running pods (the NEW :latest) are always kept. Same command the
+      # node-disk gotcha in AGENTS.md recommends.
+      ansible.builtin.command: sudo k3s crictl rmi --prune
+      register: prune
+      changed_when: prune.stdout | length > 0
+
+    - name: Disk after prune
+      ansible.builtin.shell: df -h / | awk 'NR==2{print $4" free"}'
+      register: disk_after
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} disk {{ disk_before.stdout }} -> {{ disk_after.stdout }}"

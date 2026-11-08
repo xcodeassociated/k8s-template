@@ -67,6 +67,14 @@ metadata:
     app: spring-reactive-mongo
 spec:
   replicas: 2
+  # Never run old+new pods simultaneously (2026-11-08 incident: a surge of
+  # extra JVMs swap-thrashed a 4 GB node until its kubelet died). One replica
+  # is replaced at a time — see ansible/deploy-cluster.yml.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: spring-reactive-mongo

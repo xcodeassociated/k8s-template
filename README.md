@@ -66,7 +66,7 @@ Keycloak. Remove them together with the features that reference them.
     └── 05-react-typescript-template.yaml    # frontend
 ```
 
-Also: `scripts/` (Keycloak backup/restore/realm-fix helpers, see AGENTS.md) and `ansible/` (inventory + cluster shutdown, startup, OS-update, and component-upgrade playbooks).
+Also: `scripts/` (Keycloak backup/restore/realm-fix helpers, see AGENTS.md) and `ansible/` (inventory + cluster deploy, shutdown, startup, OS-update, and component-upgrade playbooks).
 
 App end-user login credentials (for UI/Playwright checks) go in repo-root `.credential` — copy `.credential.template` and fill it; `.credential` is gitignored.
 
@@ -238,6 +238,29 @@ kubectl rollout status deployment/spring-reactive-mongo
 kubectl rollout status deployment/spring-reactive-r2dbc
 kubectl rollout status deployment/react-typescript-template
 ```
+
+### One-shot deploy (Ansible)
+
+`ansible/deploy-cluster.yml` automates the whole deploy from the current
+working tree: pushes `apps/` + `dependencies/` to the master, applies
+dependencies (idempotent), restarts each app service **one deployment at a
+time** (JVM deployments roll `maxSurge: 0` so old+new pods never overlap —
+see AGENTS.md), verifies `/external` + the public URLs, and only then
+prunes superseded images from every node:
+
+```bash
+ansible-playbook -i ansible/inventory.ini ansible/deploy-cluster.yml
+# --tags deps            dependencies only (no app rollouts, no prune)
+# --tags apps            skip dependency applies
+# --skip-tags clean      keep the old images
+# -e deploy_keycloak=true  also restart Keycloak (auth drops ~1 min)
+```
+
+Images are `:latest` + `imagePullPolicy: Always`, so a deploy re-pulls
+whatever CI published — no tags to bump. Keycloak is applied but not
+restarted by default (restarting it invalidates nothing but drops auth for
+~1 min). If any rollout or endpoint check fails the run stops **before**
+the image prune.
 
 ## Cleanup
 

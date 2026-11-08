@@ -16,6 +16,10 @@
 # operators (CNPG/Kafka/Mongo) -> app rollouts -> /external self-heal -> URLs.
 # Nothing is created or deleted; this only waits and repairs service-account
 # clients if the realm was regenerated between sessions.
+#
+# Every wait is a MINIMAL bounded window (VM boot is the only long item,
+# ~2 min); on timeout the play prints what is broken and fails — it never
+# polls on. Worst-case total runtime when everything is fine: ~4 min.
 
 - name: Power on the VMs via Proxmox (skipped without credentials)
   hosts: localhost
@@ -135,6 +139,7 @@
       # macOS firewall blocks the Python interpreter's raw sockets (same
       # reason the Proxmox tasks use curl), so wait_for on localhost can
       # hang even when port 22 is actually open.
+      # Cold-boot guests answer on :22 within ~60-90s; 2 min is the bound.
       ansible.builtin.command:
         argv:
           - ssh
@@ -150,8 +155,8 @@
           - "true"
       register: ssh_probe
       until: ssh_probe.rc == 0
-      retries: 60
-      delay: 10
+      retries: 23
+      delay: 5
       changed_when: false
       delegate_to: localhost   # booting VMs can't run the check themselves
       become: false
@@ -163,46 +168,64 @@
   vars:
     repo_dir: /home/worker/k8s-template
   tasks:
-    - name: Wait for all 4 nodes Ready
-      ansible.builtin.shell: kubectl get nodes --no-headers | grep -c ' Ready'
-      register: ready
-      until: (ready.stdout | int) >= 4
-      retries: 24
-      delay: 10
-      changed_when: false
+    - name: Wait for serving state (bounded — fail fast with diagnostics)
+      block:
+        - name: Wait for all 4 nodes Ready
+          ansible.builtin.shell: kubectl get nodes --no-headers | grep -c ' Ready'
+          register: ready
+          until: (ready.stdout | int) >= 4
+          retries: 11
+          delay: 5
+          changed_when: false
 
-    - name: Wait for Longhorn volumes healthy (attached + not faulted)
-      ansible.builtin.shell: |
-        kubectl -n longhorn-system get volumes -o jsonpath='{range .items[*]}{.status.conditions.Scheduled}{"\n"}{end}' 2>/dev/null | grep -c false || true
-      register: lh_bad
-      until: (lh_bad.stdout | default('0') | int) == 0
-      retries: 30
-      delay: 10
-      changed_when: false
+        - name: Wait for Longhorn volumes attached and not faulted
+          # degraded (replica rebuilding) still serves I/O and is acceptable;
+          # what blocks startup is detached/faulted volumes — if this times
+          # out, see AGENTS.md "Longhorn live-upgrade + reboot deadlock".
+          ansible.builtin.shell: |
+            kubectl -n longhorn-system get volumes -o jsonpath='{range .items[*]}{.status.state}{"/"}{.status.robustness}{"\n"}{end}' 2>/dev/null | grep -vc '^attached/\(healthy\|degraded\)$' || true
+          register: lh_bad
+          until: (lh_bad.stdout | default('0') | int) == 0
+          retries: 17
+          delay: 5
+          changed_when: false
 
-    - name: Wait for CNPG clusters healthy
-      ansible.builtin.command: kubectl -n postgres get clusters.postgresql.cnpg.io --no-headers
-      register: cnpg
-      until: (cnpg.stdout_lines | select('search', 'healthy') | list | list | length) >= 2
-      retries: 30
-      delay: 10
-      changed_when: false
+        - name: Wait for CNPG clusters healthy
+          ansible.builtin.command: kubectl -n postgres get clusters.postgresql.cnpg.io --no-headers
+          register: cnpg
+          until: (cnpg.stdout_lines | select('search', 'healthy') | list | list | length) >= 2
+          retries: 18
+          delay: 10
+          changed_when: false
 
-    - name: Wait for Kafka + Mongo + grafana pods Running
-      ansible.builtin.shell: kubectl get pods -A --no-headers | grep -E "^(kafka|mongo|grafana) " | grep -vcE "Running|Completed" || true
-      register: deps_bad
-      until: (deps_bad.stdout | int) == 0
-      retries: 40
-      delay: 10
-      changed_when: false
+        - name: Wait for Kafka + Mongo + grafana pods Running
+          ansible.builtin.shell: kubectl get pods -A --no-headers | grep -E "^(kafka|mongo|grafana) " | grep -vcE "Running|Completed" || true
+          register: deps_bad
+          until: (deps_bad.stdout | int) == 0
+          retries: 18
+          delay: 10
+          changed_when: false
 
-    - name: Wait for app deployments Ready
-      ansible.builtin.shell: kubectl -n default get deploy --no-headers | grep -vE "1/1" | wc -l
-      register: apps_bad
-      until: (apps_bad.stdout | int) == 0
-      retries: 36
-      delay: 10
-      changed_when: false
+        - name: Wait for app deployments Ready
+          ansible.builtin.shell: kubectl -n default get deploy --no-headers | grep -vE "1/1" | wc -l
+          register: apps_bad
+          until: (apps_bad.stdout | int) == 0
+          retries: 12
+          delay: 10
+          changed_when: false
+      rescue:
+        - name: Collect diagnostics
+          ansible.builtin.shell: |
+            echo "-- nodes:"; kubectl get nodes --no-headers 2>&1 | head -5
+            echo "-- non-running pods:"; kubectl get pods -A --no-headers 2>/dev/null | grep -vE "Running|Completed" | head -15
+            echo "-- longhorn volumes:"; kubectl -n longhorn-system get volumes -o jsonpath='{range .items[*]}{.status.state}/{.status.robustness}{"\n"}{end}' 2>/dev/null | sort | uniq -c
+            echo "-- cnpg:"; kubectl -n postgres get clusters.postgresql.cnpg.io --no-headers 2>&1
+          register: diag
+          changed_when: false
+
+        - name: Fail with diagnostics
+          ansible.builtin.fail:
+            msg: "startup did not converge — {{ diag.stdout_lines }}"
 
     - name: Check /external on both backends
       ansible.builtin.shell: |

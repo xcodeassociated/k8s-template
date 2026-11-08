@@ -5,7 +5,10 @@ metadata:
   labels:
     app: react-typescript-template
 spec:
-  replicas: 1
+  # Stateless static asset server (tokens live in the browser; SSE/WS
+  # connections terminate on the backends, not here) — replicas are freely
+  # scalable with no stickiness or fan-out requirements.
+  replicas: 2
   selector:
     matchLabels:
       app: react-typescript-template

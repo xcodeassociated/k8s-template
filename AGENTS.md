@@ -185,6 +185,10 @@ Verified: syntax + full `--check` dry run + real runs 2026-11-07: Longhorn 1.11.
 - Keycloak runs `KC_PROXY: edge` with hostname `https://auth.softeno.dev`; the realm and OAuth clients must be created manually after startup, and generated client secrets must be copied into `apps/01-secrets.yaml`.
 - App ConfigMaps wire inter-service calls on the assumption both Spring apps are in `default`.
 
+## Future work (parked)
+
+- **Session stickiness — nice-to-have, NOT required** (parked 2026-11-08): the app architecture is instance-agnostic — one-time tickets redeem on any replica (shared Mongo store), SSE/chat fan-out flows through Kafka, and clients mint a fresh ticket per reconnect. Verified live with both backends at 2 replicas: two chat.html sessions registered on **different pods** and exchanged messages both ways. The current `TraefikService` cookie (`apps/03`) only adds best-effort reconnect locality. If revisiting: Gateway API native `SessionPersistence` (GEP-1619) is **not supported by Traefik** and is being redesigned onto the `Backend` resource (GEP-4894, also unimplemented); the Traefik sticky-cookie CRD path works but stays Traefik-specific (traefik/traefik#11243). Trigger to pick this back up: only if a future feature introduces per-instance session state that Kafka fan-out does not bridge.
+
 ## Maintaining the docs
 
 **Both `README.md` and `AGENTS.md` must always be kept up to date.** After finishing development work, and before handing off, check the change against both files and update them in the same task if affected:

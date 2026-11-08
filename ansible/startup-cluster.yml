@@ -131,11 +131,28 @@
   tags: [wait]
   tasks:
     - name: Wait for SSH port
-      ansible.builtin.wait_for:
-        host: "{{ inventory_hostname }}"
-        port: 22
-        state: started
-        timeout: 420
+      # Probe with the system ssh binary, not the wait_for module: the
+      # macOS firewall blocks the Python interpreter's raw sockets (same
+      # reason the Proxmox tasks use curl), so wait_for on localhost can
+      # hang even when port 22 is actually open.
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - StrictHostKeyChecking=accept-new
+          - -o
+          - ConnectTimeout=5
+          - -p
+          - "22"
+          - "worker@{{ inventory_hostname }}"
+          - "true"
+      register: ssh_probe
+      until: ssh_probe.rc == 0
+      retries: 60
+      delay: 10
+      changed_when: false
       delegate_to: localhost   # booting VMs can't run the check themselves
       become: false
 

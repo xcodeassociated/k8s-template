@@ -82,7 +82,10 @@ Conventions:
   service-to-service auth.
 - Endpoints: `app.softeno.dev` + `www.app.softeno.dev` (frontend),
   `auth.softeno.dev` (Keycloak), `kafka.softeno.dev` (kafka-ui),
-  `otel.softeno.dev` (Grafana, LAN-restricted).
+  `otel.softeno.dev` (Grafana, LAN-restricted),
+  `api.softeno.dev/spring-reactive-template/chat.html` (WebSocket chat dev
+  tool served by the backend — needs `https://api.softeno.dev/*` in the
+  Keycloak `frontend` client's redirect URIs).
 
 ## Removing optional features
 
@@ -220,7 +223,9 @@ kubectl rollout status deployment/keycloak
 
 Create the `app` realm and the OAuth clients referenced by the app ConfigMaps
 (`backend`, `backend2`, plus any the frontend needs), then update the local
-secret files if client secrets changed.
+secret files if client secrets changed. The `frontend` client's Valid redirect
+URIs must cover the app origin (`https://app.softeno.dev/*`) and, for the
+`chat.html` dev tool, the backend origin too (`https://api.softeno.dev/*`).
 
 ### 6. Deploy applications
 

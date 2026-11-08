@@ -238,5 +238,10 @@ spec:
 # GRPC https://api.softeno.dev/com.softeno.template.grpc.SampleGrpcService/Echo
 # { "data": "123" }
 
+### chat dev tool (same URL shape as swagger, served by the backend):
+# https://api.softeno.dev/spring-reactive-template/chat.html
+# Requires the Keycloak `frontend` client to list https://api.softeno.dev/*
+# in Valid redirect URIs (the page derives the auth URL from /chat-config).
+
 ### add host to /etc/hosts:
 # sudo sh -c 'echo "127.0.0.1 api.softeno.dev" >> /etc/hosts'

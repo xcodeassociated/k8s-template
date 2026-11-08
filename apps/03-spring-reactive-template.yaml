@@ -66,7 +66,7 @@ metadata:
   labels:
     app: spring-reactive-mongo
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: spring-reactive-mongo
@@ -141,6 +141,11 @@ spec:
 # at this TraefikService wrapper instead of the plain Service. Equivalent of
 # the old nginx affinity: cookie / session-cookie-name: ws-route annotations.
 # Verified live: sticky + WebSocket hijack work fine together on Traefik v3.7.
+# With multiple replicas this is BEST-EFFORT affinity only — correctness never
+# depends on it: the ticket store lives in shared Mongo (any instance can
+# redeem), SSE/chat fan-out goes through Kafka (every instance re-emits to its
+# own subscribers), and clients mint a fresh ticket per reconnect, so random
+# placement across replicas is safe.
 apiVersion: traefik.io/v1alpha1
 kind: TraefikService
 metadata:

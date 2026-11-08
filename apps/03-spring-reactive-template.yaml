@@ -27,8 +27,10 @@ data:
   # ── WebSocket (/ws + one-time-ticket handshake) ────────────────────────────
   # Explicit enablement; allowed-origins must list the exact origins the
   # frontend/dev-chat pages are served from, or the handshake and ticket
-  # redemption are rejected (CSWSH protection). The HTTPRoute + TraefikService
-  # below handle WebSocket upgrades, streaming, and cookie-sticky sessions.
+  # redemption are rejected (CSWSH protection). The HTTPRoute below handles
+  # WebSocket upgrades and streaming; the /ws rule must not set
+  # X-Forwarded-Prefix (see the route comments), sticky sessions come from
+  # the TraefikService wrapper.
   COM_SOFTENO_WS_ENABLED: "true"
   COM_SOFTENO_WS_ALLOWED_ORIGINS: "https://app.softeno.dev,https://api.softeno.dev"
   COM_SOFTENO_TICKET_ALLOWED_ORIGINS: "https://app.softeno.dev,https://api.softeno.dev"
@@ -138,6 +140,7 @@ spec:
 # (traefik/traefik#11243; Gateway WG GEP-4894 in progress), so the route points
 # at this TraefikService wrapper instead of the plain Service. Equivalent of
 # the old nginx affinity: cookie / session-cookie-name: ws-route annotations.
+# Verified live: sticky + WebSocket hijack work fine together on Traefik v3.7.
 apiVersion: traefik.io/v1alpha1
 kind: TraefikService
 metadata:
@@ -156,13 +159,22 @@ spec:
             secure: true
 
 ---
-# ─── HTTPRoute (HTTP + WebSocket + gRPC) ───────────────────────────────────
+# ─── HTTPRoute (HTTP + WebSocket + gRPC) ─────────────────────────────────────
 # Replaces the nginx Ingress:
 #   rewrite-target /spring-reactive-template(/|$)(.*) -> /$2
 #     -> PathPrefix match + URLRewrite ReplacePrefixMatch "/"
 #   x-forwarded-prefix -> RequestHeaderModifier set X-Forwarded-Prefix
 # WebSocket Upgrade and SSE stream through Traefik with no extra config
 # (no response buffering/timeouts by default).
+#
+# ⚠ The /ws rule below MUST NOT set X-Forwarded-Prefix: with
+# forward-headers-strategy=framework Spring prepends it to the request URI,
+# so the backend's `/ws` ticket-redeem filter and security rule never match
+# the handshake -> 401 (verified live: identical route with X-F-P -> 401,
+# without -> 101; sticky and URLRewrite are innocent). X-F-P stays on the
+# general rule because springdoc needs it for the swagger `servers` URL.
+# The prefix rewrite maps /ws and /ws-ticket alike (ReplacePrefixMatch on a
+# string prefix), so ticket minting keeps working on both rules.
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
@@ -175,6 +187,21 @@ spec:
   hostnames:
     - "api.softeno.dev"
   rules:
+    # WebSocket handshake + ticket minting — rewrite ONLY, no X-Forwarded-Prefix
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /spring-reactive-template/ws
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /ws
+      backendRefs:
+        - group: traefik.io
+          kind: TraefikService
+          name: spring-reactive-mongo-sticky
     - matches:
         - path:
             type: PathPrefix

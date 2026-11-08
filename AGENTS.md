@@ -119,7 +119,9 @@ false negative.
 
 ```bash
 ansible-playbook -i ansible/inventory.ini ansible/deploy-cluster.yml
-# --tags deps | --tags apps | --skip-tags clean | -e deploy_keycloak=true
+# --tags deps | --tags apps | --skip-tags clean
+# -e restart_apps=false  (apply manifests, no rollout restarts)
+# -e deploy_keycloak=true
 ```
 
 Deploys the CURRENT WORKING TREE (pushed to the master via ansible copy —
@@ -130,7 +132,8 @@ most one extra JVM booting cluster-wide — the 2026-11-08 node-memory
 incident came from exactly that surge) → verify `/external` (with
 `scripts/fix-keycloak-service-clients.sh` self-heal) + public URLs →
 `k3s crictl rmi --prune` on every node to drop the superseded images. The
-prune play is LAST and never runs if anything before it failed. Verified
+prune play is LAST, never runs if anything before it failed, and re-gates
+endpoints itself (so `--tags clean` alone cannot prune a broken cluster). Verified
 end-to-end 2026-11-08 (freed ~9G/6G/1G on three nodes, apps 2/2 after).
 
 ### Graceful cluster shutdown (Ansible, run from the dev machine)

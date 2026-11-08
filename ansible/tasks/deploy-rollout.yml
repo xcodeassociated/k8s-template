@@ -6,6 +6,7 @@
 
 - name: "Restart (re-pull :latest) {{ item.name }}"
   ansible.builtin.command: kubectl -n default rollout restart deploy/{{ item.name }}
+  when: restart_apps | default(true) | bool
 
 - name: "Wait for {{ item.name }} to roll out"
   block:

@@ -7,8 +7,10 @@
 #
 # Options:
 #   --tags deps            dependencies only (no app rollouts, no prune)
-#   --tags apps            skip dependency applies (apps + verify + prune)
+#   --tags apps            apply + roll the apps (NO verify/prune — tags do
+#                          not chain; run verify/clean explicitly if wanted)
 #   --skip-tags clean      keep the old images on the nodes
+#   -e restart_apps=false  apply manifests only, no rollout restarts
 #   -e deploy_keycloak=true   also rollout-restart Keycloak (auth drops for
 #                             ~1 min; existing tokens keep working until exp)
 #
@@ -132,6 +134,7 @@
   vars:
     deploy_dir: /home/worker/k8s-deploy
     deploy_keycloak: false
+    restart_apps: true
     app_deployments:
       - name: spring-reactive-mongo
         timeout: 300
@@ -159,7 +162,7 @@
 
     # One deployment at a time, awaited before the next starts — this is the
     # guard against the node-memory thrash from the 2026-11-08 incident.
-    - name: "Rollout {{ item.name }}"
+    - name: Rollout one app deployment
       ansible.builtin.include_tasks: tasks/deploy-rollout.yml
       loop: "{{ app_deployments }}"
       loop_control:
@@ -173,12 +176,18 @@
     repo_dir: /home/worker/k8s-template
   tasks:
     - name: Check /external on both backends
+      # Retry until the answer is DEFINITIVE (real data or FALLBACK): right
+      # after rollouts a cold token cache can show a transient failure that
+      # would otherwise trigger the heal script for nothing.
       ansible.builtin.shell: |
         T=$(curl -s -m 8 -d "client_id=frontend" -d "username=user" -d "password=user" -d "grant_type=password" https://auth.softeno.dev/realms/app/protocol/openid-connect/token | python3 -c "import sys,json;print(json.load(sys.stdin).get('access_token',''))")
         M=$(curl -s -m 8 -H "Authorization: Bearer $T" https://api.softeno.dev/spring-reactive-template/external/1)
         R=$(curl -s -m 8 -H "Authorization: Bearer $T" https://api.softeno.dev/spring-reactive-r2dbc-template/external/1)
         echo "$M $R"
       register: ext
+      until: '"data" in ext.stdout or "FALLBACK" in ext.stdout'
+      retries: 4
+      delay: 5
       changed_when: false
 
     - name: Self-heal service-account clients if FALLBACK
@@ -208,9 +217,11 @@
       changed_when: false
 
     - name: Fail when any URL is not serving
+      # Anything that is not 2xx/3xx fails the deploy (not just a fixed list
+      # of error codes — 401/403/501 must not pass silently).
       ansible.builtin.fail:
         msg: "endpoint check failed: {{ urls.stdout_lines }}"
-      when: urls.stdout_lines | select('search', ' (000|404|500|502|503|504)$') | list | length > 0
+      when: urls.stdout_lines | reject('search', ' [23][0-9][0-9]$') | list | length > 0
 
     - name: Deploy state
       ansible.builtin.debug:
@@ -224,6 +235,30 @@
   gather_facts: false
   tags: [clean]
   tasks:
+    - name: Safety gate — the stack must be serving before any deletion
+      # Self-contained (not trusting that the verify play ran in this
+      # invocation — someone can run --tags clean alone).
+      run_once: true
+      delegate_to: kube-0.lan
+      delegate_facts: false
+      ansible.builtin.shell: |
+        T=$(curl -s -m 8 -d "client_id=frontend" -d "username=user" -d "password=user" -d "grant_type=password" https://auth.softeno.dev/realms/app/protocol/openid-connect/token | python3 -c "import sys,json;print(json.load(sys.stdin).get('access_token',''))")
+        M=$(curl -s -m 8 -H "Authorization: Bearer $T" https://api.softeno.dev/spring-reactive-template/external/1)
+        R=$(curl -s -m 8 -H "Authorization: Bearer $T" https://api.softeno.dev/spring-reactive-r2dbc-template/external/1)
+        A=$(curl -sk -o /dev/null -w '%{http_code}' -m 5 https://app.softeno.dev)
+        echo "$M $R $A"
+      register: gate
+      until: '"data" in gate.stdout and "FALLBACK" not in gate.stdout and gate.stdout is search(" 200$")'
+      retries: 3
+      delay: 5
+      changed_when: false
+      failed_when: false
+
+    - name: Abort prune when the stack is not serving
+      ansible.builtin.fail:
+        msg: "refusing to prune: endpoints not healthy ({{ gate.stdout }})"
+      when: gate.failed or not ('data' in gate.stdout | default('') and 'FALLBACK' not in gate.stdout and gate.stdout is search(' 200$'))
+
     - name: Disk before prune
       ansible.builtin.shell: df -h / | awk 'NR==2{print $4" free"}'
       register: disk_before

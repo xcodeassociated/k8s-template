@@ -251,8 +251,10 @@ prunes superseded images from every node:
 ```bash
 ansible-playbook -i ansible/inventory.ini ansible/deploy-cluster.yml
 # --tags deps            dependencies only (no app rollouts, no prune)
-# --tags apps            skip dependency applies
+# --tags apps            skip dependency applies (rollouts only — tags do
+#                        not chain, so verify/clean do NOT run with it)
 # --skip-tags clean      keep the old images
+# -e restart_apps=false  apply manifests only, no rollout restarts
 # -e deploy_keycloak=true  also restart Keycloak (auth drops ~1 min)
 ```
 

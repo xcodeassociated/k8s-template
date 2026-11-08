@@ -44,7 +44,7 @@ spec:
     spec:
       containers:
         - name: grafana
-          image: grafana/otel-lgtm:0.22.1   # pin to a specific version; update deliberately
+          image: grafana/otel-lgtm:0.40.0   # pin to a specific version; update deliberately
           ports:
             - containerPort: 3000
               name: ui

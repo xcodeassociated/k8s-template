@@ -14,7 +14,9 @@ Shared dependencies: PostgreSQL (CloudNativePG), MongoDB (Community Operator), K
 
 ## Waits are human time — critical rule
 
+- **NEVER use background tasks/shells** (`background: true`, detached jobs, `&`-spawned waiters, background subagents for waiting/watching). Everything runs in the foreground with a bounded timeout; if a wait must span turns, re-check status with a single quick foreground command instead of a background watcher.
 - **Never poll in loops or use long timeouts "just in case".** An operation either works within a short bounded window or it is broken — report what is broken instead of waiting. Long waits do not fix anything unless the operation genuinely takes that long (VM boot, pg_basebackup rejoin, Kafka rolling upgrade, replica rebuild).
+- **Run the repo's own checks locally before pushing** (full build + tests where the project has them) — CI is a gate, not a test runner.
 - **Before starting any genuinely long wait, tell the user first**: what is being waited on and the expected duration. Then use the minimum realistic bound, not a generous one.
 - Prefer one quick sample over `rollout status`/`--wait`/retry loops; when a bounded wait is justified, it must fail fast with a diagnostic (list the bad pods/volumes/conditions), never as a silent timeout.
 

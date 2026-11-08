@@ -4,7 +4,7 @@ A **template stack for starting new applications**: production-like Kubernetes
 manifests with fully wired shared dependencies — Keycloak auth, Kafka,
 PostgreSQL, MongoDB, and OTel observability — so you can spend your time on
 your service, not on infrastructure setup. Use it to **prototype and validate
-ideas fast**: apply the stack, drop in your own Deployment/Service/Ingress
+ideas fast**: apply the stack, drop in your own Deployment/Service/HTTPRoute
 bundle, and you have authentication, messaging, databases, TLS, storage, and
 dashboards working on day one.
 
@@ -35,8 +35,8 @@ and secret entries, so **anything you do not want is easy to remove** (see
 | Document database | MongoDB replica set via Community Operator | `dependencies/03-mongo.yaml` | Yes |
 | Event streaming | Kafka via Strimzi (controller + broker pools), topics, kafka-ui | `dependencies/04-kafka.yaml` | Yes |
 | Observability | Grafana otel-lgtm (Loki + Grafana + Tempo + Mimir, all-in-one), OTLP ingest | `dependencies/05-grafana.yaml` | Yes |
-| Apps (backend HTTP + gRPC, frontend SPA) | Deployment + Service + Ingress per service, actuator probes, resource limits | `apps/03…05-*.yaml` | Yes |
-| TLS + ingress | nginx ingress, cert-manager ACME (`acme-issuer`); wildcard `main-certificate` + per-host `api-certificate-prod` | referenced in every Ingress | No |
+| Apps (backend HTTP + gRPC, frontend SPA) | Deployment + Service + HTTPRoute per service, actuator probes, resource limits | `apps/03…05-*.yaml` | Yes |
+| TLS + ingress | **Traefik via the Kubernetes Gateway API** (`Gateway` `edge` in `default`, HTTPRoutes per service; chart creates the `traefik` GatewayClass), cert-manager ACME DNS-01 (`acme-issuer`); explicit `Certificate`s — wildcard `main-certificate` + per-host `api/auth/app-certificate-prod` | `dependencies/06-gateway.yaml` + one HTTPRoute per service | No |
 | Persistent storage | `longhorn` StorageClass for all PVCs | referenced in dependency manifests | No |
 | Service mesh | Linkerd sidecar injection (`linkerd.io/inject: enabled` pod annotation) | pod templates in `apps/` | Yes |
 
@@ -55,11 +55,12 @@ Keycloak. Remove them together with the features that reference them.
 │   ├── 02-postgres.yaml             # CNPG clusters: postgres-app, postgres-keycloak
 │   ├── 03-mongo.yaml                # MongoDBCommunity mongodb-rs
 │   ├── 04-kafka.yaml                # Strimzi Kafka, topics, metrics, kafka-ui
-│   └── 05-grafana.yaml              # otel-lgtm observability stack
+│   ├── 05-grafana.yaml              # otel-lgtm observability stack
+│   └── 06-gateway.yaml              # Gateway API edge (Traefik), Certificates, mgmt routes
 └── apps/                            # all deployed into the default namespace
     ├── 01-secrets.template.yaml     # committed placeholders only
     ├── 01-secrets.yaml              # local/private, ignored by git
-    ├── 02-keycloak.yaml             # Keycloak + ConfigMap + Service + Ingress
+    ├── 02-keycloak.yaml             # Keycloak + ConfigMap + Service + HTTPRoute
     ├── 03-spring-reactive-template.yaml     # deployment "spring-reactive-mongo"
     ├── 04-spring-reactive-r2dbc.yaml        # deployment "spring-reactive-r2dbc"
     └── 05-react-typescript-template.yaml    # frontend
@@ -72,7 +73,8 @@ App end-user login credentials (for UI/Playwright checks) go in repo-root `.cred
 Conventions:
 
 - Each app file is a self-contained bundle: `ConfigMap` (non-secret config) +
-  `Secret` refs via `envFrom` + `Deployment` + `Service` + `Ingress`.
+  `Secret` refs via `envFrom` + `Deployment` + `Service` + `HTTPRoute`
+  (attaching to the shared `edge` Gateway from `dependencies/06-gateway.yaml`).
 - Dependencies run in dedicated namespaces; applications run in `default`.
 - The two Spring backends share the host `api.softeno.dev` and are routed by
   path prefix (`/spring-reactive-template/…`, `/spring-reactive-r2dbc-template/…`);
@@ -106,15 +108,19 @@ rename the resources, image, hosts, and paths.
 
 - A Kubernetes cluster and a `kubectl` context pointing at the target cluster.
 - `helm` for installing the operators (CloudNativePG, MongoDB Community, Strimzi).
-- `cert-manager` with a `ClusterIssuer` named `acme-issuer`, an nginx ingress
-  controller, and **Linkerd** (app pods request sidecar injection).
+- `cert-manager` with a `ClusterIssuer` named `acme-issuer` (DNS-01 — issuance
+  does not depend on the proxy), **Gateway API standard CRDs** (bundled with
+  k3s; otherwise the release's `standard-install.yaml`), and **Traefik**
+  installed with the Gateway API provider (helm command in the header of
+  `dependencies/06-gateway.yaml`), plus **Linkerd** (app pods and the Traefik
+  pods request sidecar injection).
 - The `longhorn` StorageClass (or edit the manifests to use your default).
 - Working DNS for the `*.softeno.dev` hosts (see `/etc/hosts` hints in the
   app manifests for local use).
 - Replace example image names, domains, and resource sizes before using this
-  outside a lab. If ACME certificates do not issue, make sure public DNS
-  reaches the ingress and remove local/router DNS overrides intercepting the
-  validation hostnames.
+  outside a lab. Certificates issue via **DNS-01 (Cloudflare)** — public
+  reachability of the hosts is irrelevant; if issuance fails, check the
+  `cloudflare-api-token-secret` and the zone's DNS delegation instead.
 
 ## Setup order
 
@@ -153,6 +159,13 @@ helm repo update
 helm upgrade --install strimzi-operator strimzi/strimzi-kafka-operator \
   --namespace kafka \
   --set watchNamespaces='{kafka}'
+
+# Traefik (Gateway API provider; creates the "traefik" GatewayClass + CRDs)
+# values: see the header of dependencies/06-gateway.yaml
+helm repo add traefik https://traefik.github.io/charts
+helm repo update
+helm upgrade --install traefik traefik/traefik \
+  --namespace traefik --create-namespace -f traefik-values.yaml
 ```
 
 Verify:
@@ -191,6 +204,7 @@ kubectl apply -f dependencies/02-postgres.yaml
 kubectl apply -f dependencies/03-mongo.yaml
 kubectl apply -f dependencies/04-kafka.yaml
 kubectl apply -f dependencies/05-grafana.yaml
+kubectl apply -f dependencies/06-gateway.yaml   # Gateway + Certificates — before the apps
 kubectl get pods -n postgres
 kubectl get pods -n mongo
 kubectl get pods -n kafka
@@ -233,6 +247,7 @@ kubectl delete -f apps/05-react-typescript-template.yaml --ignore-not-found
 kubectl delete -f apps/04-spring-reactive-r2dbc.yaml --ignore-not-found
 kubectl delete -f apps/03-spring-reactive-template.yaml --ignore-not-found
 kubectl delete -f apps/02-keycloak.yaml --ignore-not-found
+kubectl delete -f dependencies/06-gateway.yaml --ignore-not-found
 kubectl delete -f dependencies/05-grafana.yaml --ignore-not-found
 kubectl delete -f dependencies/04-kafka.yaml --ignore-not-found
 kubectl delete -f dependencies/03-mongo.yaml --ignore-not-found
@@ -247,6 +262,7 @@ Optionally uninstall operators if nothing else uses them:
 helm uninstall strimzi-operator -n kafka || true
 helm uninstall mongodb-community-operator -n mongo || true
 helm uninstall cnpg -n postgres || true
+helm uninstall traefik -n traefik || true
 ```
 
 Finally delete namespaces (`kubectl delete -f dependencies/00-namespaces.yaml`)
@@ -326,5 +342,5 @@ run.
 - Keep local `**/*secrets.yaml` files, `.credential`, and `keycloak-realm/` backups ignored and private.
 - Do not commit kubeconfigs, certificates with private keys, tokens, or `.env` files.
 - Run a secret scan before publishing the repository.
-- Review hard-coded domains, image names, storage sizes, and ingress settings
+- Review hard-coded domains, image names, storage sizes, and routing settings
   (e.g. the `MONGO_DB: "admin"` placeholder in `apps/03-spring-reactive-template.yaml`).

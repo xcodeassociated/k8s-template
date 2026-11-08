@@ -340,7 +340,7 @@
   vars:
     helm_deps:
       - {release: cert-manager, repo: cert-manager, url: https://charts.jetstack.io, chart: cert-manager/cert-manager, ns: cert-manager, deploy: cert-manager}
-      - {release: ingress-nginx, repo: ingress-nginx, url: https://kubernetes.github.io/ingress-nginx, chart: ingress-nginx/ingress-nginx, ns: ingress-nginx, deploy: ingress-nginx-controller}
+      - {release: traefik, repo: traefik, url: https://traefik.github.io/charts, chart: traefik/traefik, ns: traefik, deploy: traefik}
       - {release: cnpg, repo: cnpg, url: https://cloudnative-pg.github.io/charts, chart: cnpg/cloudnative-pg, ns: postgres, deploy: cnpg-controller-manager}
       - {release: mongodb-community-operator, repo: mongodb, url: https://mongodb.github.io/helm-charts, chart: mongodb/community-operator, ns: mongo, deploy: mongodb-kubernetes-operator}
       - {release: strimzi-operator, repo: strimzi, url: https://strimzi.io/charts/, chart: strimzi/strimzi-kafka-operator, ns: kafka, deploy: strimzi-cluster-operator}

@@ -27,8 +27,8 @@ data:
   # ── WebSocket (/ws + one-time-ticket handshake) ────────────────────────────
   # Explicit enablement; allowed-origins must list the exact origins the
   # frontend/dev-chat pages are served from, or the handshake and ticket
-  # redemption are rejected (CSWSH protection). The BE Ingress already carries
-  # the Upgrade/timeouts/buffering/sticky-session annotations.
+  # redemption are rejected (CSWSH protection). The HTTPRoute + TraefikService
+  # below handle WebSocket upgrades, streaming, and cookie-sticky sessions.
   COM_SOFTENO_WS_ENABLED: "true"
   COM_SOFTENO_WS_ALLOWED_ORIGINS: "https://app.softeno.dev,https://api.softeno.dev"
   COM_SOFTENO_TICKET_ALLOWED_ORIGINS: "https://app.softeno.dev,https://api.softeno.dev"
@@ -127,83 +127,89 @@ spec:
     - name: grpc
       port: 9080
       targetPort: 9080
+      # GRPCRoute backend protocol hint — Traefik accepts kubernetes.io/h2c
+      # (or https) here; kubernetes.io/grpc is rejected with UnsupportedProtocol
+      appProtocol: kubernetes.io/h2c
   type: ClusterIP
 
 ---
-# ─── Ingress (HTTP + WebSocket) ───────────────────────────────────────────────
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+# ─── TraefikService (cookie stickiness for WebSocket reconnects) ──────────────
+# Sticky sessions are not expressible in the Gateway API HTTPRoute spec yet
+# (traefik/traefik#11243; Gateway WG GEP-4894 in progress), so the route points
+# at this TraefikService wrapper instead of the plain Service. Equivalent of
+# the old nginx affinity: cookie / session-cookie-name: ws-route annotations.
+apiVersion: traefik.io/v1alpha1
+kind: TraefikService
+metadata:
+  name: spring-reactive-mongo-sticky
+  labels:
+    app: spring-reactive-mongo
+spec:
+  weighted:
+    services:
+      - name: spring-reactive-mongo
+        port: 8080
+        weight: 1
+        sticky:
+          cookie:
+            name: ws-route
+            secure: true
+
+---
+# ─── HTTPRoute (HTTP + WebSocket + gRPC) ───────────────────────────────────
+# Replaces the nginx Ingress:
+#   rewrite-target /spring-reactive-template(/|$)(.*) -> /$2
+#     -> PathPrefix match + URLRewrite ReplacePrefixMatch "/"
+#   x-forwarded-prefix -> RequestHeaderModifier set X-Forwarded-Prefix
+# WebSocket Upgrade and SSE stream through Traefik with no extra config
+# (no response buffering/timeouts by default).
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
 metadata:
   name: spring-reactive-mongo
   labels:
     app: spring-reactive-mongo
-  annotations:
-    cert-manager.io/cluster-issuer: acme-issuer
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
-    nginx.ingress.kubernetes.io/proxy-buffering: "off"
-    # Sticky sessions — important for WebSocket reconnects
-    nginx.ingress.kubernetes.io/affinity: "cookie"
-    nginx.ingress.kubernetes.io/affinity-mode: "persistent"
-    nginx.ingress.kubernetes.io/session-cookie-name: "ws-route"
-    nginx.ingress.kubernetes.io/session-cookie-expires: "3600"
-    nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
-    nginx.ingress.kubernetes.io/x-forwarded-prefix: "/spring-reactive-template"
-    nginx.ingress.kubernetes.io/rewrite-target: "/$2"
 spec:
-  ingressClassName: nginx
-  tls:
-    - hosts:
-        - "api.softeno.dev"
-      secretName: api-certificate-prod
+  parentRefs:
+    - name: edge
+  hostnames:
+    - "api.softeno.dev"
   rules:
-    - host: "api.softeno.dev"
-      http:
-        paths:
-          - path: /spring-reactive-template(/|$)(.*)
-            pathType: ImplementationSpecific
-            backend:
-              service:
-                name: spring-reactive-mongo
-                port:
-                  number: 8080
-
-### add host to /etc/hosts:
-# sudo sh -c 'echo "127.0.0.1 api.softeno.dev" >> /etc/hosts'
-
----
-# ─── Ingress (gRPC) ───────────────────────────────────────────────────────────
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: spring-reactive-mongo-grpc
-  annotations:
-    cert-manager.io/cluster-issuer: acme-issuer
-    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
-    nginx.ingress.kubernetes.io/proxy-buffering: "off"
-    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
-spec:
-  ingressClassName: nginx
-  tls:
-    - hosts:
-        - "api.softeno.dev"
-      secretName: api-certificate-prod
-  rules:
-    - host: "api.softeno.dev"
-      http:
-        paths:
-          - path: /com.softeno.template.grpc.SampleGrpcService
-            pathType: Prefix
-            backend:
-              service:
-                name: spring-reactive-mongo
-                port:
-                  number: 9080
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /spring-reactive-template
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set:
+              - name: X-Forwarded-Prefix
+                value: /spring-reactive-template
+      backendRefs:
+        - group: traefik.io
+          kind: TraefikService
+          name: spring-reactive-mongo-sticky
+    # gRPC (replaces the nginx backend-protocol: GRPC Ingress): a second rule
+    # on the SAME route. A separate GRPCRoute on the same hostname fails with
+    # HostnameConflict in Traefik v3.7; the h2c backend protocol comes from
+    # appProtocol on the Service port (HTTPRouteBackendProtocolH2C, core
+    # conformance). Client-side TLS/h2 is served by the `api` listener.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /com.softeno.template.grpc.SampleGrpcService
+      backendRefs:
+        - name: spring-reactive-mongo
+          port: 9080
 
 ### example gRPC unary call:
 # GRPC https://api.softeno.dev/com.softeno.template.grpc.SampleGrpcService/Echo
 # { "data": "123" }
+
+### add host to /etc/hosts:
+# sudo sh -c 'echo "127.0.0.1 api.softeno.dev" >> /etc/hosts'

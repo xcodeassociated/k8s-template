@@ -1,0 +1,242 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Edge routing: Traefik via the Kubernetes Gateway API (replaces nginx Ingress)
+#
+# PREREQUISITES — run once before applying this file:
+#
+#   Gateway API standard CRDs must exist. k3s ships them; otherwise:
+#     helm upgrade --install gateway-api-crd https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.tgz
+#   (or apply the standard-install.yaml from that release).
+#
+#   Traefik (creates GatewayClass "traefik" + its own CRDs — Middleware,
+#   TraefikService, …):
+#
+#     helm repo add traefik https://traefik.github.io/charts
+#     helm repo update
+#     helm upgrade --install traefik traefik/traefik \
+#       --namespace traefik --create-namespace -f traefik-values.yaml
+#
+#   traefik-values.yaml:
+#     providers:
+#       kubernetesIngress:
+#         enabled: false      # Gateway API only — no Ingress objects processed
+#       kubernetesGateway:
+#         enabled: true
+#     gatewayClass:
+#       enabled: true         # creates GatewayClass "traefik"
+#     gateway:
+#       enabled: false        # the Gateway is owned by this file, not the chart
+#     deployment:
+#       replicas: 2
+#       podAnnotations:
+#         linkerd.io/inject: enabled   # meshed like the app backends it proxies to
+#     ports:
+#       web:
+#         http:
+#           redirections:
+#             entryPoint:
+#               to: websecure
+#               scheme: https
+#               permanent: true        # global HTTP -> HTTPS (nginx force-ssl-redirect)
+#
+#   The chart's entrypoints listen on container ports 8000/8443 and are exposed
+#   as Service ports 80/443 — Gateway listener ports MUST be 8000/8443.
+#
+# TLS: cert-manager issues and renews the Secrets below via the DNS-01
+# ClusterIssuer `acme-issuer` (Cloudflare) — independent of the ingress
+# controller. These Certificate resources are deliberately EXPLICIT (no
+# cert-manager.io/cluster-issuer annotation on the Gateway): the Gateway
+# listeners reference the Secrets by name via certificateRefs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── Gateway (all public hosts, one edge in `default`) ────────────────────────
+# Routes in other namespaces (kafka, grafana, cattle-system, linkerd-viz)
+# attach through parentRefs.namespace: default — allowed by from: All below.
+# Cross-namespace backendRefs are NOT used, so no ReferenceGrants are needed.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: edge
+  namespace: default
+spec:
+  gatewayClassName: traefik
+  listeners:
+    - name: http
+      port: 8000
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: All
+    - name: app
+      hostname: app.softeno.dev
+      port: 8443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: app-certificate-prod
+      allowedRoutes:
+        namespaces:
+          from: All
+    - name: app-www
+      hostname: www.app.softeno.dev
+      port: 8443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: app-certificate-prod
+      allowedRoutes:
+        namespaces:
+          from: All
+    - name: api
+      hostname: api.softeno.dev
+      port: 8443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: api-certificate-prod
+      allowedRoutes:
+        namespaces:
+          from: All
+    - name: auth
+      hostname: auth.softeno.dev
+      port: 8443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: auth-certificate-prod
+      allowedRoutes:
+        namespaces:
+          from: All
+    # Catch-all for every other *.softeno.dev host (kafka, otel, rancher,
+    # linkerd-viz, …). More-specific per-host listeners above win on SNI/Host.
+    - name: wildcard
+      hostname: "*.softeno.dev"
+      port: 8443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: main-certificate
+      allowedRoutes:
+        namespaces:
+          from: All
+
+---
+# ─── Certificates ─────────────────────────────────────────────────────────────
+# Names/secretNames/dnsNames match the previously shim-generated Certificates
+# so the existing TLS Secrets are adopted and renewed without reissuing.
+
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: main-certificate
+  namespace: default
+spec:
+  secretName: main-certificate
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: acme-issuer
+  dnsNames:
+    - "*.softeno.dev"
+    - "*.app.softeno.dev"
+    - "*.api.softeno.dev"
+    - "softeno.dev"
+
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: api-certificate-prod
+  namespace: default
+spec:
+  secretName: api-certificate-prod
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: acme-issuer
+  dnsNames:
+    - "api.softeno.dev"
+  usages:
+    - digital signature
+    - key encipherment
+
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: auth-certificate-prod
+  namespace: default
+spec:
+  secretName: auth-certificate-prod
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: acme-issuer
+  dnsNames:
+    - "auth.softeno.dev"
+  usages:
+    - digital signature
+    - key encipherment
+
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: app-certificate-prod
+  namespace: default
+spec:
+  secretName: app-certificate-prod
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: acme-issuer
+  dnsNames:
+    - "app.softeno.dev"
+    - "www.app.softeno.dev"
+  usages:
+    - digital signature
+    - key encipherment
+
+---
+# ─── Cluster-management routes (not part of the core template) ───────────────
+# These two hosts were served by nginx Ingresses created by the Rancher /
+# Linkerd-viz installs. The HTTPRoutes live in each service's own namespace so
+# backendRefs stay same-namespace (no ReferenceGrants needed); they attach to
+# the `edge` Gateway in `default` and are covered by the wildcard listener.
+
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: rancher
+  namespace: cattle-system
+spec:
+  parentRefs:
+    - name: edge
+      namespace: default
+  hostnames:
+    - rancher.softeno.dev
+  rules:
+    - backendRefs:
+        - name: rancher
+          port: 80
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: linkerd-viz
+  namespace: linkerd-viz
+spec:
+  parentRefs:
+    - name: edge
+      namespace: default
+  hostnames:
+    - linkerd.softeno.dev
+  rules:
+    - backendRefs:
+        - name: web
+          port: 8084

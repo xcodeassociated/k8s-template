@@ -103,34 +103,42 @@ spec:
   type: ClusterIP
 
 ---
-# ─── Ingress ──────────────────────────────────────────────────────────────────
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+# ─── Grafana route (Gateway API, LAN-restricted) ──────────────────────────────
+# whitelist-source-range -> ipAllowList middleware (client IP is SNAT'd to the
+# node IP behind k3s servicelb — same effective behavior as under nginx).
+# TLS terminates at the `edge` Gateway `wildcard` listener
+# (dependencies/06-gateway.yaml, secret main-certificate in `default`).
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
 metadata:
-  name: grafana-ingress
+  name: grafana-allowlist
   namespace: grafana
-  annotations:
-    cert-manager.io/cluster-issuer: acme-issuer
-    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
-    nginx.ingress.kubernetes.io/service-upstream: "true"
-    nginx.ingress.kubernetes.io/whitelist-source-range: |
-      10.0.0.0/8,
-      172.16.0.0/12,
-      192.168.0.0/16
 spec:
-  ingressClassName: nginx
+  ipAllowList:
+    sourceRange:
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.0.0/16"
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: grafana
+  namespace: grafana
+spec:
+  parentRefs:
+    - name: edge
+      namespace: default
+  hostnames:
+    - otel.softeno.dev
   rules:
-    - host: otel.softeno.dev
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: grafana
-                port:
-                  number: 3000
-  tls:
-    - hosts:
-        - "*.softeno.dev"
-      secretName: main-certificate
+    - filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: traefik.io
+            kind: Middleware
+            name: grafana-allowlist
+      backendRefs:
+        - name: grafana
+          port: 3000

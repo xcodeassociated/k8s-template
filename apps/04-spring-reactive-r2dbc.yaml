@@ -115,33 +115,41 @@ spec:
   type: ClusterIP
 
 ---
-# ─── Ingress ──────────────────────────────────────────────────────────────────
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+# ─── HTTPRoute (Gateway API) ─────────────────────────────────────────────────
+# Replaces the nginx Ingress: rewrite-target prefix strip -> URLRewrite
+# ReplacePrefixMatch; x-forwarded-prefix -> RequestHeaderModifier. SSE streams
+# through with no buffering/timeouts to configure. TLS: `api` listener on the
+# `edge` Gateway (dependencies/06-gateway.yaml), secret api-certificate-prod.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
 metadata:
-  name: spring-reactive-r2dbc-ingress
-  annotations:
-    cert-manager.io/cluster-issuer: acme-issuer
-    nginx.ingress.kubernetes.io/proxy-buffering: "off"
-    nginx.ingress.kubernetes.io/x-forwarded-prefix: "/spring-reactive-r2dbc-template"
-    nginx.ingress.kubernetes.io/rewrite-target: "/$2"
+  name: spring-reactive-r2dbc
+  labels:
+    app: spring-reactive-r2dbc
 spec:
-  ingressClassName: nginx
-  tls:
-    - hosts:
-        - "api.softeno.dev"
-      secretName: api-certificate-prod
+  parentRefs:
+    - name: edge
+  hostnames:
+    - "api.softeno.dev"
   rules:
-    - host: "api.softeno.dev"
-      http:
-        paths:
-          - path: /spring-reactive-r2dbc-template(/|$)(.*)
-            pathType: ImplementationSpecific
-            backend:
-              service:
-                name: spring-reactive-r2dbc
-                port:
-                  number: 8082
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /spring-reactive-r2dbc-template
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set:
+              - name: X-Forwarded-Prefix
+                value: /spring-reactive-r2dbc-template
+      backendRefs:
+        - name: spring-reactive-r2dbc
+          port: 8082
 
 ### add host to /etc/hosts:
 # sudo sh -c 'echo "127.0.0.1 api.softeno.dev" >> /etc/hosts'

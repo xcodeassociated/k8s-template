@@ -59,47 +59,44 @@ spec:
       targetPort: 80
   type: ClusterIP
 
+# ─── Middleware + HTTPRoute (Gateway API) ────────────────────────────────────
+# proxy-body-size: 10m -> buffering middleware (rejects bodies > 10 MB);
+# force-ssl-redirect is global in the Traefik install (web -> websecure).
+# TLS: `app`/`app-www` listeners on the `edge` Gateway
+# (dependencies/06-gateway.yaml), secret app-certificate-prod.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: react-typescript-body-limit
+  labels:
+    app: react-typescript-template
+spec:
+  buffering:
+    maxRequestBodyBytes: 10485760   # 10 MB
+
 ---
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
 metadata:
   name: react-typescript-template
   labels:
     app: react-typescript-template
-  annotations:
-    cert-manager.io/cluster-issuer: acme-issuer
-    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
-    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
-    # Uncomment to restrict to specific IPs:
-    # nginx.ingress.kubernetes.io/whitelist-source-range: "A.B.C.D/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 spec:
-  ingressClassName: nginx
-  tls:
-    - hosts:
-        - "app.softeno.dev"
-        - "www.app.softeno.dev"
-      secretName: app-certificate-prod
+  parentRefs:
+    - name: edge
+  hostnames:
+    - "app.softeno.dev"
+    - "www.app.softeno.dev"
   rules:
-    - host: "app.softeno.dev"
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: react-typescript-template
-                port:
-                  number: 80
-    - host: "www.app.softeno.dev"
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: react-typescript-template
-                port:
-                  number: 80
+    - filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: traefik.io
+            kind: Middleware
+            name: react-typescript-body-limit
+      backendRefs:
+        - name: react-typescript-template
+          port: 80
 
 ### add hosts to /etc/hosts for local testing:
 # sudo sh -c 'echo "127.0.0.1 app.softeno.dev" >> /etc/hosts'

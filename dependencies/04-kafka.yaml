@@ -297,34 +297,44 @@ spec:
   type: ClusterIP
 
 ---
-# ─── Kafka UI Ingress ─────────────────────────────────────────────────────────
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+# ─── Kafka UI route (Gateway API) ─────────────────────────────────────────────
+# whitelist-source-range -> ipAllowList middleware. NOTE: behind k3s servicelb
+# the client IP is SNAT'd to the node IP (same as it was behind nginx), so this
+# allowlist effectively matches LAN/node ranges. force-ssl-redirect is global
+# in the Traefik install. TLS terminates at the `edge` Gateway `wildcard`
+# listener (dependencies/06-gateway.yaml, secret main-certificate) — the old
+# per-namespace main-certificate is no longer needed here.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
 metadata:
-  name: kafka-ui-ingress
+  name: kafka-ui-allowlist
   namespace: kafka
-  annotations:
-    cert-manager.io/cluster-issuer: acme-issuer
-    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
-    nginx.ingress.kubernetes.io/service-upstream: "true"
-    nginx.ingress.kubernetes.io/whitelist-source-range: |
-      10.0.0.0/8,
-      172.16.0.0/12,
-      192.168.0.0/16
 spec:
-  ingressClassName: nginx
+  ipAllowList:
+    sourceRange:
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.0.0/16"
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: kafka-ui
+  namespace: kafka
+spec:
+  parentRefs:
+    - name: edge
+      namespace: default
+  hostnames:
+    - kafka.softeno.dev
   rules:
-    - host: kafka.softeno.dev
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: kafka-ui
-                port:
-                  number: 8080
-  tls:
-    - hosts:
-        - "*.softeno.dev"
-      secretName: main-certificate
+    - filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: traefik.io
+            kind: Middleware
+            name: kafka-ui-allowlist
+      backendRefs:
+        - name: kafka-ui
+          port: 8080
